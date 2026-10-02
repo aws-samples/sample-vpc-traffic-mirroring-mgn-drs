@@ -1,0 +1,3065 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Automates VPC Traffic Mirroring for AWS Transform MGN and DRS replication troubleshooting.
+  Specify a source server ID, and this template adds unique staging tags so the service assigns
+  a separate service-managed replication server, then configures traffic mirroring with tcpdump.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Required - Source Server Configuration"
+        Parameters:
+          - ReplicationService
+          - SourceServerId
+      - Label:
+          default: "Optional - Mirror Target Instance Configuration"
+        Parameters:
+          - MirrorTargetInstanceType
+          - AssignPublicIP
+      - Label:
+          default: "Optional - Alarm Notifications"
+        Parameters:
+          - EnableAlarmNotifications
+          - AlarmNotificationTopicArn
+    ParameterLabels:
+      ReplicationService:
+        default: "Which replication service are you using?"
+      SourceServerId:
+        default: "Source Server ID"
+      MirrorTargetInstanceType:
+        default: "Mirror Target Instance Type"
+      AssignPublicIP:
+        default: "Assign Public IP to Mirror Target?"
+      EnableAlarmNotifications:
+        default: "Publish Alarm State Changes to SNS?"
+      AlarmNotificationTopicArn:
+        default: "Existing SNS Topic ARN"
+
+Parameters:
+  ReplicationService:
+    Type: String
+    AllowedValues:
+      - "AWS Transform MGN"
+      - "AWS Elastic Disaster Recovery (DRS)"
+    Description: |
+      Select the replication service you are using. This determines which API 
+      to use for updating the source server's replication settings with the mirroring tag.
+
+  SourceServerId:
+    Type: String
+    Description: |
+      The Source Server ID experiencing replication issues.
+      - For Transform MGN: Found in the console under "Source servers" (e.g., s-1234567890abcdef0)
+      - For DRS: Found in the DRS console under "Source servers" (e.g., s-1234567890abcdef0)
+      
+      This source server will get unique staging tags added to its replication settings.
+      Because sources can share a replication server only when their settings match,
+      MGN/DRS assigns a separate service-managed replication server while preserving
+      the existing useDedicatedReplicationServer value.
+    AllowedPattern: "^s-[a-f0-9]{17}$"
+    ConstraintDescription: "Must be a valid source server ID (e.g., s-1234567890abcdef0)"
+
+  MirrorTargetInstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+      - r5.large
+      - r5.xlarge
+    Description: |
+      Instance type for the mirror target EC2 instance. All listed types support 
+      VPC Traffic Mirroring. Choose based on expected traffic volume:
+      - t3.small: Low traffic, cost-effective (recommended for most cases)
+      - t3.medium/large: Moderate traffic
+      - m5/c5/r5 instances: High traffic volumes requiring more network bandwidth
+      
+      Full list of supported types: 
+      https://docs.aws.amazon.com/vpc/latest/mirroring/what-is-traffic-mirroring.html#supported-instance-types
+
+  AssignPublicIP:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: |
+      Whether to assign a public IP to the mirror target instance for outbound bootstrap and SSM connectivity.
+      - true: Uses the subnet internet gateway for outbound SSM and Amazon Linux repository access; the stack does not add management ingress
+      - false: No public IP assigned; the VPC must provide private outbound access
+
+      If set to 'false', ensure the target subnet has:
+      - NAT or another path to the Amazon Linux package repositories for tcpdump installation, AND
+      - VPC endpoints or NAT connectivity for ssm and ssmmessages
+
+  EnableAlarmNotifications:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: |
+      Controls only SNS notification delivery; the six CloudWatch alarms are
+      always created and remain visible in the CloudWatch console.
+      - false (default): no SNS messages are sent. Use NONE for the topic ARN.
+      - true: each alarm publishes only its ALARM transition to the existing
+        customer-owned SNS topic specified below. OK and INSUFFICIENT_DATA
+        transitions are recorded in CloudWatch but are not published, avoiding
+        startup and recovery email noise.
+
+  AlarmNotificationTopicArn:
+    Type: String
+    Default: "NONE"
+    AllowedPattern: "^NONE$|^arn:[a-z0-9-]+:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]{1,256}$"
+    ConstraintDescription: "Use NONE when notifications are disabled, or provide a valid SNS topic ARN."
+    Description: |
+      Existing customer-owned SNS topic ARN in the same account and Region,
+      preferably. Required only when EnableAlarmNotifications is true. The ARN
+      pattern validates syntax but cannot dynamically bind the account; treat
+      cross-account or cross-Region delivery as a separately reviewed design.
+      Before deployment, configure and confirm the desired subscriptions and
+      any required encryption or topic policy. This stack only references the
+      ARN; it does not create, modify, subscribe to, encrypt, or delete the topic.
+
+Rules:
+  AlarmTopicRequiredWhenNotificationsEnabled:
+    RuleCondition: !Equals [!Ref EnableAlarmNotifications, "true"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AlarmNotificationTopicArn, "NONE"]]
+        AssertDescription: "Provide AlarmNotificationTopicArn when alarm notifications are enabled."
+
+Conditions:
+  AlarmNotificationsEnabled: !Equals [!Ref EnableAlarmNotifications, "true"]
+  MgnReplicationService: !Equals [!Ref ReplicationService, "AWS Transform MGN"]
+
+Resources:
+  #============================================================================
+  # STEP 1: Tag the Source Server's Replication Settings
+  # This makes the source's replication settings unique so MGN/DRS assigns
+  # a separate service-managed replication server without changing the
+  # existing useDedicatedReplicationServer setting.
+  #============================================================================
+  
+  TagSourceServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-TagSourceServer"
+      RetentionInDays: 14
+
+  TagSourceServerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TagSourceServerLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-TagSourceServer"
+      Description: "Adds mirroring tag to source server replication settings"
+      Handler: index.handler
+      Role: !GetAtt TagSourceServerRole.Arn
+      Runtime: python3.11
+      Timeout: 120
+      MemorySize: 128
+      ReservedConcurrentExecutions: 1
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import contextlib
+          import io
+
+          _cfnresponse_send = cfnresponse.send
+
+          def quiet_cfnresponse_send(*args, **kwargs):
+              # The runtime helper prints the complete CloudFormation response
+              # body. Preserve its delivery behavior while discarding that
+              # unnecessary infrastructure metadata from Lambda logs.
+              with contextlib.redirect_stdout(io.StringIO()):
+                  with contextlib.redirect_stderr(io.StringIO()):
+                      return _cfnresponse_send(*args, **kwargs)
+
+          cfnresponse.send = quiet_cfnresponse_send
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ssm = boto3.client('ssm')
+
+          def safe_error(error):
+              response = getattr(error, 'response', {}) or {}
+              details = response.get('Error', {}) or {}
+              return {
+                  'Type': type(error).__name__,
+                  'Code': details.get('Code', 'UnhandledError'),
+                  'Operation': getattr(error, 'operation_name', 'unknown')
+              }
+
+          def error_code(error):
+              response = getattr(error, 'response', {}) or {}
+              return (response.get('Error', {}) or {}).get('Code', '')
+
+          def acquire_source_lock(parameter_name, stack_id):
+              """Atomically claim this service/source pair across all stacks."""
+              # Read first so rollback can recognize the old stack-owned lock
+              # before CloudFormation restores the parameter-derived IAM policy.
+              try:
+                  current = ssm.get_parameter(Name=parameter_name)
+                  if current['Parameter'].get('Value') == stack_id:
+                      return 'owned'
+                  return 'conflict'
+              except Exception as error:
+                  if error_code(error) != 'ParameterNotFound':
+                      raise
+
+              try:
+                  ssm.put_parameter(
+                      Name=parameter_name, Type='String', Value=stack_id,
+                      Overwrite=False)
+                  return 'acquired'
+              except Exception as error:
+                  if error_code(error) != 'ParameterAlreadyExists':
+                      raise
+              # Another stack won the create race. Read the winning value.
+              current = ssm.get_parameter(Name=parameter_name)
+              if current['Parameter'].get('Value') == stack_id:
+                  return 'owned'
+              return 'conflict'
+
+          def release_source_lock(parameter_name, stack_id):
+              """Release only a lock whose value still equals this StackId."""
+              try:
+                  current = ssm.get_parameter(Name=parameter_name)
+              except Exception as error:
+                  if error_code(error) == 'ParameterNotFound':
+                      return
+                  raise
+              if current['Parameter'].get('Value') == stack_id:
+                  ssm.delete_parameter(Name=parameter_name)
+
+          def handler(event, context):
+              # Log only the request type - never the full event, which carries
+              # the signed CloudFormation ResponseURL and other sensitive fields.
+              logger.info(f"RequestType: {event.get('RequestType')}")
+              
+              # Stable physical ID tied to the source server, so a stack update
+              # never makes CloudFormation treat this custom resource as replaced
+              # (which would fire a Delete against the old resource).
+              props = event.get('ResourceProperties', {})
+              deterministic_id = f"TagSourceServer-{props.get('SourceServerId', 'unknown')}"
+              physical_id = event.get('PhysicalResourceId') or deterministic_id
+              lock_created_this_attempt = False
+              ownership_applied = False
+              
+              if event['RequestType'] == 'Delete':
+                  # On stack deletion, remove the mirroring tag
+                  try:
+                      outcome = remove_mirroring_tag(event['ResourceProperties'])
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                      {'Message': outcome},
+                                      physicalResourceId=physical_id)
+                  except Exception as e:
+                      details = safe_error(e)
+                      logger.error("Tag removal failed: %s", details)
+                      cfnresponse.send(event, context, cfnresponse.FAILED,
+                                      {'Error': details},
+                                      physicalResourceId=physical_id)
+                  return
+              
+              try:
+                  service = props['ReplicationService']
+                  source_server_id = props['SourceServerId']
+                  stack_id = props['StackId']
+                  changed = []
+                  if event['RequestType'] == 'Update':
+                      old_props = event.get('OldResourceProperties', {})
+                      changed = [
+                          key for key in ('ReplicationService', 'SourceServerId')
+                          if old_props.get(key) != props.get(key)
+                      ]
+                  
+                  # Determine which service client to use
+                  if 'MGN' in service:
+                      client = boto3.client('mgn')
+                      service_name = 'mgn'
+                  else:
+                      client = boto3.client('drs')
+                      service_name = 'drs'
+                  
+                  # The source marker identifies the source server. The fixed
+                  # ownership key carries this stack's globally unique ID. A new
+                  # stack changes MirroringStackId, forcing a distinct ownership
+                  # value while updates to this stack keep the same value.
+                  tag_key = f"Mirroring-{source_server_id}"
+                  tag_value = "yes"
+                  ownership_tag_key = "MirroringStackId"
+                  
+                  logger.info(f"Adding mirroring ownership tags to {source_server_id} via {service_name}")
+                  
+                  # Verify source server exists
+                  response = client.describe_source_servers(
+                      filters={'sourceServerIDs': [source_server_id]}
+                  )
+                  if not response['items']:
+                      if changed:
+                          logger.error("Immutable replication identity change rejected fields=%s",
+                                       sorted(changed))
+                          cfnresponse.send(
+                              event, context, cfnresponse.FAILED,
+                              {'Error': {
+                                  'Type': 'ValidationError',
+                                  'Code': 'ImmutableReplicationIdentity',
+                                  'Operation': 'Update'
+                              }}, physicalResourceId=physical_id)
+                          return
+                      raise ValueError(f"Source server {source_server_id} not found in {service_name.upper()}")
+                  
+                  # Get FULL current replication configuration (required to preserve all settings)
+                  current_config = client.get_replication_configuration(
+                      sourceServerID=source_server_id
+                  )
+                  # Do not log the full configuration - it contains infrastructure
+                  # detail (subnet, security groups, KMS key ARN). Log only that it was retrieved.
+                  logger.info(f"Retrieved replication configuration for {source_server_id}")
+                  
+                  # Preserve existing staging-area tags and claim ownership for
+                  # this stack. MirroringStackId is intentionally a single fixed
+                  # key, and deployment is refused while another StackId owns it.
+                  current_tags = dict(current_config.get('stagingAreaTags', {}))
+                  current_owner = current_tags.get(ownership_tag_key)
+                  current_marker = current_tags.get(tag_key)
+
+                  # Source/service migration requires a separate stack. Reject a
+                  # forward Update to a different identity, but allow CloudFormation
+                  # rollback when the desired (old) identity is already owned.
+                  if event['RequestType'] == 'Update':
+                      desired_already_owned = (
+                          current_marker == tag_value and current_owner == stack_id
+                      )
+                      if changed and not desired_already_owned:
+                          logger.error("Immutable replication identity change rejected fields=%s",
+                                       sorted(changed))
+                          cfnresponse.send(
+                              event, context, cfnresponse.FAILED,
+                              {'Error': {
+                                  'Type': 'ValidationError',
+                                  'Code': 'ImmutableReplicationIdentity',
+                                  'Operation': 'Update'
+                              }}, physicalResourceId=physical_id)
+                          return
+
+                  # Atomically serialize ownership across stacks before the
+                  # MGN/DRS read-check-update sequence. Parameter Store's
+                  # Overwrite=False is the account/Region/source claim boundary.
+                  ownership_parameter_name = props['OwnershipParameterName']
+                  lock_status = acquire_source_lock(
+                      ownership_parameter_name, stack_id)
+                  if lock_status == 'conflict':
+                      logger.error("Source ownership conflict; deployment rejected")
+                      cfnresponse.send(
+                          event, context, cfnresponse.FAILED,
+                          {'Error': {
+                              'Type': 'ValidationError',
+                              'Code': 'SourceAlreadyOwned',
+                              'Operation': 'CreateOrUpdate'
+                          }}, physicalResourceId=physical_id)
+                      return
+                  lock_created_this_attempt = lock_status == 'acquired'
+
+                  # Re-read after acquiring the lock so a legacy tag owner or a
+                  # configuration change cannot slip through the pre-lock read.
+                  current_config = client.get_replication_configuration(
+                      sourceServerID=source_server_id)
+                  current_tags = dict(current_config.get('stagingAreaTags', {}))
+                  current_owner = current_tags.get(ownership_tag_key)
+                  current_marker = current_tags.get(tag_key)
+
+                  # This sample supports one owning stack per source. Refuse a
+                  # takeover rather than implementing last-writer-wins semantics
+                  # that cannot restore the previous owner during rollback.
+                  if (current_owner and current_owner != stack_id) or (
+                          current_marker and current_owner != stack_id):
+                      if lock_created_this_attempt:
+                          release_source_lock(ownership_parameter_name, stack_id)
+                          lock_created_this_attempt = False
+                      logger.error("Source ownership conflict; deployment rejected")
+                      cfnresponse.send(
+                          event, context, cfnresponse.FAILED,
+                          {'Error': {
+                              'Type': 'ValidationError',
+                              'Code': 'SourceAlreadyOwned',
+                              'Operation': 'CreateOrUpdate'
+                          }}, physicalResourceId=physical_id)
+                      return
+
+                  # A harmless CloudFormation update can invoke this custom
+                  # resource even when the desired ownership tags already match.
+                  # Avoid an unnecessary MGN/DRS update call in that case. This
+                  # keeps Update and rollback idempotent and prevents a transient
+                  # service error from failing an otherwise no-op stack update.
+                  if (current_tags.get(tag_key) == tag_value and
+                          current_tags.get(ownership_tag_key) == stack_id):
+                      ownership_applied = True
+                      logger.info("Mirroring ownership tags already current; "
+                                  "replication configuration update skipped")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'TagKey': tag_key,
+                          'TagValue': tag_value,
+                          'OwnershipTagKey': ownership_tag_key,
+                          'SourceServerId': source_server_id,
+                          'Service': service_name,
+                          'Message': 'Mirroring ownership tags already current'
+                      }, physicalResourceId=physical_id)
+                      return
+
+                  current_tags[tag_key] = tag_value
+                  current_tags[ownership_tag_key] = stack_id
+                  
+                  # Build update params - must include all required fields to preserve existing config
+                  update_params = {
+                      'sourceServerID': source_server_id,
+                      'stagingAreaTags': current_tags
+                  }
+                  
+                  # Preserve all existing configuration fields
+                  config_fields = [
+                      'associateDefaultSecurityGroup',
+                      'bandwidthThrottling',
+                      'createPublicIP',
+                      'dataPlaneRouting',
+                      'defaultLargeStagingDiskType',
+                      'ebsEncryption',
+                      'ebsEncryptionKeyArn',
+                      'replicatedDisks',
+                      'replicationServerInstanceType',
+                      'replicationServersSecurityGroupsIDs',
+                      'stagingAreaSubnetId',
+                      'useDedicatedReplicationServer'
+                  ]
+                  
+                  for field in config_fields:
+                      if field in current_config and current_config[field] is not None:
+                          # Handle empty strings - some fields don't accept empty string
+                          if current_config[field] != '':
+                              update_params[field] = current_config[field]
+                  
+                  # Log only the fields being set, not their values (values include
+                  # subnet IDs, security group IDs, and KMS key ARNs).
+                  logger.info(f"Updating replication configuration fields: {sorted(update_params.keys())}")
+                  
+                  # Update replication configuration with all existing settings plus our new tag
+                  client.update_replication_configuration(**update_params)
+                  ownership_applied = True
+                  
+                  logger.info(f"Successfully added mirroring tag to {source_server_id}")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'TagKey': tag_key,
+                      'TagValue': tag_value,
+                      'OwnershipTagKey': ownership_tag_key,
+                      'SourceServerId': source_server_id,
+                      'Service': service_name,
+                      'Message': f'Mirroring tag added. A new replication server will launch for {source_server_id}'
+                  }, physicalResourceId=physical_id)
+                  
+              except Exception as e:
+                  if lock_created_this_attempt and not ownership_applied:
+                      try:
+                          release_source_lock(
+                              props['OwnershipParameterName'],
+                              props.get('StackId', ''))
+                      except Exception as release_error:
+                          logger.error("Source lock release failed: %s",
+                                       safe_error(release_error))
+                  details = safe_error(e)
+                  logger.error("Tag update failed: %s", details)
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                  {'Error': details}, physicalResourceId=physical_id)
+          
+          def remove_mirroring_tag(props):
+              """Remove tags only if this stack still owns the source setting."""
+              service = props['ReplicationService']
+              source_server_id = props['SourceServerId']
+              stack_id = props['StackId']
+              tag_key = f"Mirroring-{source_server_id}"
+              ownership_tag_key = "MirroringStackId"
+              
+              if 'MGN' in service:
+                  client = boto3.client('mgn')
+              else:
+                  client = boto3.client('drs')
+              
+              # Verify source server still exists
+              response = client.describe_source_servers(
+                  filters={'sourceServerIDs': [source_server_id]}
+              )
+              if not response['items']:
+                  logger.info(f"Source server {source_server_id} not found, skipping tag removal")
+                  return 'Source server no longer exists; no tag removal required'
+              
+              # Get full current replication configuration
+              current_config = client.get_replication_configuration(
+                  sourceServerID=source_server_id
+              )
+              
+              current_tags = current_config.get('stagingAreaTags', {})
+              current_owner = current_tags.get(ownership_tag_key)
+              if current_owner != stack_id:
+                  # Another stack may have been deployed for the same source
+                  # server after this one. Never remove that stack's active tags.
+                  logger.info("Replication setting is not owned by this stack; skipping tag removal")
+                  return 'Ownership belongs to another stack; tags left unchanged'
+              
+              # This stack still owns the setting, so remove both its source
+              # marker and ownership tag. pop() keeps deletion retry-safe.
+              current_tags.pop(tag_key, None)
+              current_tags.pop(ownership_tag_key, None)
+              
+              # Build update params preserving all existing config
+              update_params = {
+                  'sourceServerID': source_server_id,
+                  'stagingAreaTags': current_tags
+              }
+              
+              config_fields = [
+                  'associateDefaultSecurityGroup',
+                  'bandwidthThrottling',
+                  'createPublicIP',
+                  'dataPlaneRouting',
+                  'defaultLargeStagingDiskType',
+                  'ebsEncryption',
+                  'ebsEncryptionKeyArn',
+                  'replicatedDisks',
+                  'replicationServerInstanceType',
+                  'replicationServersSecurityGroupsIDs',
+                  'stagingAreaSubnetId',
+                  'useDedicatedReplicationServer'
+              ]
+              
+              for field in config_fields:
+                  if field in current_config and current_config[field] is not None:
+                      if current_config[field] != '':
+                          update_params[field] = current_config[field]
+              
+              client.update_replication_configuration(**update_params)
+              logger.info(f"Successfully removed mirroring tag from {source_server_id}")
+              return 'Mirroring ownership tags removed'
+
+  TagSourceServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-TagSourceServerRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ScopedLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Intentionally no logs:CreateLogGroup - prevents the Lambda from
+              # recreating its log group after CloudFormation deletes it on
+              # stack deletion (trailing async log delivery would otherwise
+              # resurrect the group as an unmanaged orphan)
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-TagSourceServer:*"
+        - PolicyName: MGNDRSPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DescribeSourceServers does not support resource-level scope.
+              - Sid: DescribeReplicationSources
+                Effect: Allow
+                Action:
+                  - mgn:DescribeSourceServers
+                  - drs:DescribeSourceServers
+                Resource: '*'
+              # During a failed identity update, CloudFormation invokes rollback
+              # before restoring this role's parameter-derived policy. Read-only
+              # configuration access must therefore cover either old source. All
+              # mutation remains restricted to the currently selected source ARN.
+              - Sid: ReadReplicationConfigurationForRollback
+                Effect: Allow
+                Action:
+                  - mgn:GetReplicationConfiguration
+                  - drs:GetReplicationConfiguration
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:mgn:${AWS::Region}:${AWS::AccountId}:source-server/*"
+                  - !Sub "arn:${AWS::Partition}:drs:${AWS::Region}:${AWS::AccountId}:source-server/*"
+              - Sid: UpdateSelectedMgnSourceReplicationConfiguration
+                Effect: Allow
+                Action: mgn:UpdateReplicationConfiguration
+                Resource: !Sub "arn:${AWS::Partition}:mgn:${AWS::Region}:${AWS::AccountId}:source-server/${SourceServerId}"
+              - Sid: UpdateSelectedDrsSourceReplicationConfiguration
+                Effect: Allow
+                Action: drs:UpdateReplicationConfiguration
+                Resource: !Sub "arn:${AWS::Partition}:drs:${AWS::Region}:${AWS::AccountId}:source-server/${SourceServerId}"
+              # MGN/DRS UpdateReplicationConfiguration performs dependent
+              # authorization against the configured staging subnet and security
+              # groups. The Lambda does not call these EC2 APIs directly, but the
+              # service rejects the update unless the caller can describe them.
+              - Sid: AuthorizeReplicationNetworkConfiguration
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                Resource: '*'
+              # Rollback can invoke the old custom-resource identity before
+              # CloudFormation restores this parameter-derived role policy.
+              # Read-only lock access therefore spans this dedicated namespace;
+              # creating or deleting a lock stays exact to the selected source.
+              - Sid: ReadSourceOwnershipLocksForRollback
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/vpc-traffic-mirroring/ownership/*"
+              - Sid: ManageSelectedSourceOwnershipLock
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                Resource: !If
+                  - MgnReplicationService
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/vpc-traffic-mirroring/ownership/mgn/${SourceServerId}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/vpc-traffic-mirroring/ownership/drs/${SourceServerId}"
+
+  # Custom resource to trigger the tag addition
+  TagSourceServer:
+    Type: Custom::TagSourceServer
+    DependsOn:
+      - MirroringEventRule
+      - LambdaInvokePermission
+    Properties:
+      ServiceToken: !GetAtt TagSourceServerFunction.Arn
+      # Covers the 120-second function plus Lambda's two asynchronous retries,
+      # while shortening CloudFormation's default one-hour wait.
+      ServiceTimeout: 600
+      ReplicationService: !Ref ReplicationService
+      SourceServerId: !Ref SourceServerId
+      StackId: !Ref AWS::StackId
+      OwnershipParameterName: !If
+        - MgnReplicationService
+        - !Sub "/vpc-traffic-mirroring/ownership/mgn/${SourceServerId}"
+        - !Sub "/vpc-traffic-mirroring/ownership/drs/${SourceServerId}"
+
+  #============================================================================
+  # STEP 2: Dynamic AMI Lookup for Latest Amazon Linux 2023
+  #============================================================================
+  
+  AMILookupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-AMILookup"
+      RetentionInDays: 14
+
+  AMIInfoFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AMILookupLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-AMILookup"
+      Handler: index.handler
+      Role: !GetAtt AMIInfoFunctionRole.Arn
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 128
+      ReservedConcurrentExecutions: 1
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import contextlib
+          import io
+
+          _cfnresponse_send = cfnresponse.send
+
+          def quiet_cfnresponse_send(*args, **kwargs):
+              # The runtime helper prints the complete CloudFormation response
+              # body. Preserve its delivery behavior while discarding that
+              # unnecessary infrastructure metadata from Lambda logs.
+              with contextlib.redirect_stdout(io.StringIO()):
+                  with contextlib.redirect_stderr(io.StringIO()):
+                      return _cfnresponse_send(*args, **kwargs)
+
+          cfnresponse.send = quiet_cfnresponse_send
+
+          def safe_error(error):
+              response = getattr(error, 'response', {}) or {}
+              details = response.get('Error', {}) or {}
+              return {
+                  'Type': type(error).__name__,
+                  'Code': details.get('Code', 'UnhandledError'),
+                  'Operation': getattr(error, 'operation_name', 'unknown')
+              }
+          
+          def handler(event, context):
+              physical_id = event.get('PhysicalResourceId') or "LatestAL2023AMI"
+              if event['RequestType'] in ['Create', 'Update']:
+                  try:
+                      ec2 = boto3.client('ec2')
+                      response = ec2.describe_images(
+                          Owners=['amazon'],
+                          Filters=[
+                              {'Name': 'name', 'Values': ['al2023-ami-2023.*-x86_64']},
+                              {'Name': 'state', 'Values': ['available']},
+                              {'Name': 'architecture', 'Values': ['x86_64']}
+                          ]
+                      )
+                      
+                      images = sorted(response['Images'],
+                                   key=lambda x: x['CreationDate'],
+                                   reverse=True)
+                      
+                      if not images:
+                          cfnresponse.send(event, context, cfnresponse.FAILED,
+                                         {'Error': 'No AL2023 AMI found'},
+                                         physicalResourceId=physical_id)
+                          return
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                     {'Id': images[0]['ImageId']},
+                                     physicalResourceId=physical_id)
+                  except Exception as e:
+                      cfnresponse.send(event, context, cfnresponse.FAILED,
+                                     {'Error': safe_error(e)}, physicalResourceId=physical_id)
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {},
+                                 physicalResourceId=physical_id)
+
+  AMIInfoFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ScopedLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The log group is created explicitly above. Do not grant
+              # logs:CreateLogGroup: after the custom resource sends its Delete
+              # response, trailing Lambda log delivery can race CloudFormation's
+              # log-group deletion and otherwise recreate an untagged orphan.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-AMILookup:*"
+        - PolicyName: DescribeImagesPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeImages
+                Resource: '*'
+
+  LatestAL2023AMI:
+    Type: Custom::LatestAMI
+    Properties:
+      ServiceToken: !GetAtt AMIInfoFunction.Arn
+      # Covers the 30-second function plus Lambda's two asynchronous retries.
+      ServiceTimeout: 300
+
+  #============================================================================
+  # STEP 3: IAM Roles for Lambda and EC2 (Session Manager)
+  #============================================================================
+  
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-MirroringFunction"
+      RetentionInDays: 14
+
+  # Dead-letter queue for the event-driven mirroring function. Failed async
+  # invocations land here after retries so they are not silently lost.
+  # SSE-SQS (SQS-managed keys) encrypts messages at rest.
+  MirroringDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-MirroringDLQ"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # Separate DLQ for failures before Lambda accepts the EventBridge delivery.
+  MirroringEventBridgeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-EventBridgeDLQ"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # SQS requires each policy statement to name exactly one queue resource.
+  # Keep the Lambda processing DLQ policy separate from the EventBridge DLQ.
+  MirroringDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref MirroringDLQ
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource: !GetAtt MirroringDLQ.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  MirroringEventBridgeDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref MirroringEventBridgeDLQ
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource: !GetAtt MirroringEventBridgeDLQ.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: AllowExactEventBridgeRule
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt MirroringEventBridgeDLQ.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${AWS::StackName}-RSMirroringRule"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  MirroringInventoryParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/traffic-mirroring/inventory"
+      Type: String
+      Value: "{}"
+      Description: "Durable exact-ID inventory for retry-safe traffic mirroring setup"
+      Tags:
+        StackName: !Ref AWS::StackName
+        StackId: !Ref AWS::StackId
+
+  # Cleanup is the only writer that transitions this guard to DELETING.
+  # Setup can read but cannot overwrite it, removing the inventory check/write race.
+  MirroringLifecycleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/traffic-mirroring/lifecycle"
+      Type: String
+      Value: "ACTIVE"
+      Description: "Monotonic lifecycle guard for setup and cleanup coordination"
+      Tags:
+        StackName: !Ref AWS::StackName
+        StackId: !Ref AWS::StackId
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-MirroringLambdaRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ScopedLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Intentionally no logs:CreateLogGroup - prevents this Lambda from
+              # recreating its log group after CloudFormation deletes it on
+              # stack deletion. Cleanup has a separate role and log statement.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-MirroringFunction:*"
+        - PolicyName: EC2AndTrafficMirroringPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read-only discovery. Most EC2 Describe actions do not support
+              # resource-level permissions, so these use Resource '*'.
+              - Sid: ReadOnlyDiscovery
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTrafficMirrorFilters
+                  - ec2:DescribeTrafficMirrorSessions
+                  - ec2:DescribeTrafficMirrorTargets
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+                Resource: '*'
+
+              - Sid: ReadSelectedMgnReplicationConfiguration
+                Effect: Allow
+                Action: mgn:GetReplicationConfiguration
+                Resource: !Sub "arn:${AWS::Partition}:mgn:${AWS::Region}:${AWS::AccountId}:source-server/${SourceServerId}"
+              # DescribeSourceServers is a read/list action without resource-level
+              # authorization. The API request is filtered to the selected source.
+              - Sid: ReadSelectedMgnReplicationServerAssociation
+                Effect: Allow
+                Action: mgn:DescribeSourceServers
+                Resource: '*'
+              - Sid: ReadSelectedDrsReplicationConfiguration
+                Effect: Allow
+                Action: drs:GetReplicationConfiguration
+                Resource: !Sub "arn:${AWS::Partition}:drs:${AWS::Region}:${AWS::AccountId}:source-server/${SourceServerId}"
+
+              # CreateSecurityGroup is a composite authorization operation: EC2
+              # checks both the new security group and the existing VPC. Require
+              # the stack tag on the new SG, while separately allowing use of a
+              # VPC in this account and Region.
+              - Sid: CreateTaggedSecurityGroup
+                Effect: Allow
+                Action: ec2:CreateSecurityGroup
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/StackId: !Ref AWS::StackId
+              - Sid: CreateSecurityGroupInVpc
+                Effect: Allow
+                Action: ec2:CreateSecurityGroup
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/*"
+              - Sid: ConfigureTaggedSecurityGroup
+                Effect: Allow
+                Action:
+                  - ec2:AuthorizeSecurityGroupIngress
+                  # CreateSecurityGroup adds allow-all egress by default. Setup
+                  # removes it and permits only HTTPS needed by SSM and package
+                  # repositories. These actions remain tag-scoped to this SG.
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupEgress
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/StackId: !Ref AWS::StackId
+
+              # RunInstances checks every created and referenced resource. Apply
+              # each condition only where EC2 supplies that context key. The
+              # instance authorization enforces both StackId and selected type;
+              # the newly created ENI/volume support request tags but not the
+              # ec2:InstanceType condition during their resource authorization.
+              - Sid: RunTaggedMirrorTargetInstance
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/StackId: !Ref AWS::StackId
+                    # The parameter itself is allowlisted. Binding the instance
+                    # authorization prevents setup from selecting another type.
+                    ec2:InstanceType: !Ref MirrorTargetInstanceType
+              - Sid: RunTaggedMirrorTargetStorageAndNetwork
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/StackId: !Ref AWS::StackId
+              - Sid: RunInstancesWithApprovedInfrastructure
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  # Use the exact Amazon-owned AMI returned by the lookup custom
+                  # resource rather than authorizing every accessible AMI. The
+                  # subnet remains dynamic because it must equal the verified
+                  # service-managed replication server's runtime subnet.
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/${LatestAL2023AMI.Id}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
+              - Sid: RunInstancesWithStackSecurityGroup
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/StackId: !Ref AWS::StackId
+
+              # Require request-time ownership tags on each traffic-mirroring
+              # resource created by the Lambda.
+              - Sid: CreateTaggedTrafficMirrorResources
+                Effect: Allow
+                Action:
+                  - ec2:CreateTrafficMirrorFilter
+                  - ec2:CreateTrafficMirrorTarget
+                  - ec2:CreateTrafficMirrorSession
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-filter/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-target/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-session/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/StackId: !Ref AWS::StackId
+
+              # A mirror target references the stack-created target ENI.
+              - Sid: CreateMirrorTargetOnStackEni
+                Effect: Allow
+                Action: ec2:CreateTrafficMirrorTarget
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/StackId: !Ref AWS::StackId
+
+              # A mirror session references the service-managed replication ENI,
+              # which cannot carry this stack's ownership tag, plus a target and
+              # filter that must both be owned by this stack.
+              - Sid: CreateMirrorSessionFromReplicationEni
+                Effect: Allow
+                Action: ec2:CreateTrafficMirrorSession
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+              - Sid: CreateMirrorSessionWithStackResources
+                Effect: Allow
+                Action: ec2:CreateTrafficMirrorSession
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-filter/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-target/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/StackId: !Ref AWS::StackId
+
+              # Filter rules are not taggable. Authorize the generated rule ARN
+              # only when the parent filter is tagged as owned by this stack.
+              - Sid: AddRuleToStackFilter
+                Effect: Allow
+                Action: ec2:CreateTrafficMirrorFilterRule
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-filter/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/StackId: !Ref AWS::StackId
+              - Sid: CreateTrafficMirrorFilterRuleResource
+                Effect: Allow
+                Action: ec2:CreateTrafficMirrorFilterRule
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-filter-rule/*"
+
+              # TagSpecifications trigger a separate CreateTags authorization.
+              # Permit it only during the listed create operations and only when
+              # the request includes this stack's ownership tag.
+              - Sid: TagResourcesOnCreate
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-filter/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-target/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-session/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/StackId: !Ref AWS::StackId
+                    ec2:CreateAction:
+                      - CreateSecurityGroup
+                      - RunInstances
+                      - CreateTrafficMirrorFilter
+                      - CreateTrafficMirrorTarget
+                      - CreateTrafficMirrorSession
+
+              # Destructive actions remain restricted to resources already tagged
+              # as owned by this stack. The service-managed replication server is
+              # never terminated by this role.
+              - Sid: DeleteOnlyStackOwnedResources
+                Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DeleteTrafficMirrorFilter
+                  - ec2:DeleteTrafficMirrorSession
+                  - ec2:DeleteTrafficMirrorTarget
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-filter/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-target/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-session/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/StackId: !Ref AWS::StackId
+
+              - Sid: PassSessionManagerRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt SessionManagerRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ec2.amazonaws.com
+              - Sid: SendToDLQ
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt MirroringDLQ.Arn
+              - Sid: PersistMirroringInventory
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MirroringInventoryParameter}"
+              - Sid: ReadLifecycleGuard
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MirroringLifecycleParameter}"
+
+  CleanupExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-CleanupLambdaRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ScopedCleanupLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-Cleanup:*"
+        - PolicyName: CleanupOwnedMirroringResources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadOnlyCleanupDiscovery
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTrafficMirrorFilters
+                  - ec2:DescribeTrafficMirrorSessions
+                  - ec2:DescribeTrafficMirrorTargets
+                  - ec2:DescribeSecurityGroups
+                Resource: '*'
+              - Sid: DeleteOnlyStackOwnedResources
+                Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DeleteTrafficMirrorFilter
+                  - ec2:DeleteTrafficMirrorSession
+                  - ec2:DeleteTrafficMirrorTarget
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-filter/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-target/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-session/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/StackId: !Ref AWS::StackId
+              - Sid: PersistCleanupInventory
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MirroringInventoryParameter}"
+              - Sid: ClaimLifecycleDeletion
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MirroringLifecycleParameter}"
+              - Sid: ReleaseSourceOwnershipLock
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:DeleteParameter
+                Resource: !If
+                  - MgnReplicationService
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/vpc-traffic-mirroring/ownership/mgn/${SourceServerId}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/vpc-traffic-mirroring/ownership/drs/${SourceServerId}"
+
+  SessionManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-SessionManagerRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SessionManagerCoreWithoutParameterReads
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ManagedInstanceCore
+                Effect: Allow
+                Action:
+                  - ssm:DescribeAssociation
+                  - ssm:GetDeployablePatchSnapshotForInstance
+                  - ssm:GetDocument
+                  - ssm:DescribeDocument
+                  - ssm:GetManifest
+                  - ssm:ListAssociations
+                  - ssm:ListInstanceAssociations
+                  - ssm:PutInventory
+                  - ssm:PutComplianceItems
+                  - ssm:PutConfigurePackageResult
+                  - ssm:UpdateAssociationStatus
+                  - ssm:UpdateInstanceAssociationStatus
+                  - ssm:UpdateInstanceInformation
+                Resource: '*'
+              - Sid: SessionManagerChannels
+                Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: '*'
+              - Sid: LegacyAgentMessageChannels
+                Effect: Allow
+                Action:
+                  - ec2messages:AcknowledgeMessage
+                  - ec2messages:DeleteMessage
+                  - ec2messages:FailMessage
+                  - ec2messages:GetEndpoint
+                  - ec2messages:GetMessages
+                  - ec2messages:SendReply
+                Resource: '*'
+
+  SessionManagerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${AWS::StackName}-SessionManagerProfile"
+      Roles: 
+        - !Ref SessionManagerRole
+
+  #============================================================================
+  # STEP 4: Main Lambda - Detects Tagged RS and Configures Traffic Mirroring
+  #============================================================================
+  
+  MirroringLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-MirroringFunction"
+      Description: "Configures traffic mirroring when a tagged replication server launches"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 600
+      MemorySize: 256
+      # Single-source-server tool: one concurrent execution is enough and it
+      # bounds blast radius if many EC2 running-events arrive at once.
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt MirroringDLQ.Arn
+      Environment:
+        Variables:
+          AMI_ID: !GetAtt LatestAL2023AMI.Id
+          INSTANCE_TYPE: !Ref MirrorTargetInstanceType
+          STACK_NAME: !Ref AWS::StackName
+          STACK_ID: !Ref AWS::StackId
+          IAM_INSTANCE_PROFILE: !Ref SessionManagerInstanceProfile
+          SOURCE_SERVER_ID: !Ref SourceServerId
+          REPLICATION_SERVICE: !Ref ReplicationService
+          ASSIGN_PUBLIC_IP: !Ref AssignPublicIP
+          INVENTORY_PARAMETER: !Ref MirroringInventoryParameter
+          LIFECYCLE_PARAMETER: !Ref MirroringLifecycleParameter
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import time
+          import os
+          import logging
+          import hashlib
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ec2 = boto3.client('ec2')
+          ssm = boto3.client('ssm')
+
+          def get_expected_staging_subnet(replication_service, source_server_id):
+              """Read the selected source's configured staging subnet.
+
+              Candidate replication servers must run in this exact subnet.
+              """
+              client = boto3.client(
+                  'mgn' if 'MGN' in replication_service else 'drs')
+              config = client.get_replication_configuration(
+                  sourceServerID=source_server_id)
+              subnet_id = config.get('stagingAreaSubnetId')
+              if not subnet_id:
+                  raise ValueError('MissingStagingAreaSubnetId')
+              return subnet_id
+
+          def mgn_replicator_matches(replication_service, source_server_id,
+                                     instance_id, context):
+              """Require MGN's authoritative source-to-replicator mapping.
+
+              DRS does not expose replicatorId, so its existing layered checks
+              remain in force. MGN can publish replicatorId several minutes
+              after the EC2 running event, so poll within this invocation while
+              preserving at least five minutes for setup and rollback.
+              """
+              if 'MGN' not in replication_service:
+                  return True
+
+              client = boto3.client('mgn')
+              for attempt in range(31):
+                  response = client.describe_source_servers(
+                      filters={'sourceServerIDs': [source_server_id]})
+                  sources = response.get('items', [])
+                  if len(sources) != 1:
+                      raise ValueError('UnexpectedMgnSourceServerCount')
+                  replicator_id = (sources[0].get('dataReplicationInfo', {})
+                                   .get('replicatorId'))
+                  if replicator_id:
+                      matches = replicator_id == instance_id
+                      if matches:
+                          logger.info(
+                              "MGN authoritative replicator matched poll=%s",
+                              attempt + 1)
+                      return matches
+                  if attempt < 30:
+                      if context.get_remaining_time_in_millis() <= 310000:
+                          break
+                      time.sleep(10)
+              raise ValueError('MgnReplicatorIdUnavailable')
+
+          def safe_error(error):
+              response = getattr(error, 'response', {}) or {}
+              details = response.get('Error', {}) or {}
+              return {
+                  'Type': type(error).__name__,
+                  'Code': details.get('Code', 'UnhandledError'),
+                  'Operation': getattr(error, 'operation_name', 'unknown')
+              }
+
+          def get_instance_details(instance_id):
+              """Get VPC, subnet, IP, and ENI details for an instance"""
+              response = ec2.describe_instances(InstanceIds=[instance_id])
+              if not response['Reservations']:
+                  raise ValueError(f"No instance found: {instance_id}")
+              
+              instance = response['Reservations'][0]['Instances'][0]
+              network_interfaces = instance.get('NetworkInterfaces', [])
+              # MGN/DRS replication servers are service-managed single-ENI
+              # instances. Fail closed if that service invariant ever changes.
+              if len(network_interfaces) != 1:
+                  raise ValueError('UnexpectedReplicationServerEniCount')
+              source_eni = network_interfaces[0]
+              if source_eni.get('Attachment', {}).get('DeviceIndex') != 0:
+                  raise ValueError('UnexpectedReplicationServerPrimaryEni')
+              return {
+                  'vpc_id': instance['VpcId'],
+                  'subnet_id': instance['SubnetId'],
+                  'private_ip': instance['PrivateIpAddress'],
+                  'network_interface_id': source_eni['NetworkInterfaceId']
+              }
+
+          def error_code(error):
+              response = getattr(error, 'response', {}) or {}
+              return (response.get('Error', {}) or {}).get('Code', '')
+
+          def is_not_found(error):
+              return 'NotFound' in error_code(error)
+
+          def tags_dict(resource):
+              return {tag['Key']: tag['Value'] for tag in resource.get('Tags', [])}
+
+          def verify_owned(resource, stack_id, source_server_id,
+                           replication_server_id, resource_label):
+              tags = tags_dict(resource)
+              expected = {
+                  'StackId': stack_id,
+                  'SourceServerId': source_server_id,
+                  'ReplicationServerId': replication_server_id
+              }
+              if any(tags.get(key) != value for key, value in expected.items()):
+                  raise ValueError(f"OwnershipMismatch:{resource_label}")
+
+          def ownership_filters(stack_id, source_server_id, replication_server_id):
+              return [
+                  {'Name': 'tag:StackId', 'Values': [stack_id]},
+                  {'Name': 'tag:SourceServerId', 'Values': [source_server_id]},
+                  {'Name': 'tag:ReplicationServerId', 'Values': [replication_server_id]}
+              ]
+
+          def one_or_none(items, resource_label):
+              if len(items) > 1:
+                  raise ValueError(f"DuplicateOwnedResources:{resource_label}")
+              return items[0] if items else None
+
+          class StackDeletingError(Exception):
+              pass
+
+          def read_inventory(parameter_name):
+              response = ssm.get_parameter(Name=parameter_name)
+              raw = response['Parameter'].get('Value', '{}')
+              return json.loads(raw) if raw else {}
+
+          def load_inventory(parameter_name, stack_id, source_server_id,
+                             replication_server_id):
+              document = read_inventory(parameter_name)
+              if not document:
+                  document = {
+                      'Version': 1,
+                      'StackId': stack_id,
+                      'SourceServerId': source_server_id,
+                      'LifecycleState': 'ACTIVE',
+                      'Deployments': {}
+                  }
+              if (document.get('StackId') != stack_id or
+                      document.get('SourceServerId') != source_server_id):
+                  raise ValueError('InventoryOwnershipMismatch')
+              document.setdefault('LifecycleState', 'ACTIVE')
+              if document['LifecycleState'] != 'ACTIVE':
+                  raise StackDeletingError('StackLifecycleNotActive')
+              deployments = document.setdefault('Deployments', {})
+              record = deployments.setdefault(replication_server_id, {})
+              return document, record
+
+          def ensure_active(parameter_name):
+              lifecycle_name = os.environ['LIFECYCLE_PARAMETER']
+              response = ssm.get_parameter(Name=lifecycle_name)
+              if response['Parameter'].get('Value') != 'ACTIVE':
+                  raise StackDeletingError('StackLifecycleNotActive')
+              current = read_inventory(parameter_name)
+              if current and current.get('LifecycleState', 'ACTIVE') != 'ACTIVE':
+                  raise StackDeletingError('StackLifecycleNotActive')
+
+          def save_inventory(parameter_name, document):
+              # Never let an in-flight setup overwrite cleanup's DELETING marker.
+              ensure_active(parameter_name)
+              document['LifecycleState'] = 'ACTIVE'
+              value = json.dumps(document, separators=(',', ':'), sort_keys=True)
+              if len(value.encode('utf-8')) > 4096:
+                  raise ValueError('InventorySizeExceeded')
+              ssm.put_parameter(Name=parameter_name, Type='String', Value=value,
+                                Overwrite=True)
+
+          def clear_active_invocation(parameter_name, request_id):
+              current = read_inventory(parameter_name)
+              if current.get('ActiveInvocationId') == request_id:
+                  current.pop('ActiveInvocationId', None)
+                  current.pop('ActiveInvocationExpiresAt', None)
+                  value = json.dumps(current, separators=(',', ':'), sort_keys=True)
+                  if len(value.encode('utf-8')) > 4096:
+                      raise ValueError('InventorySizeExceeded')
+                  ssm.put_parameter(Name=parameter_name, Type='String', Value=value,
+                                    Overwrite=True)
+
+          def find_security_group(recorded_id, stack_id, source_server_id,
+                                  replication_server_id, vpc_id):
+              groups = []
+              if recorded_id:
+                  try:
+                      groups = ec2.describe_security_groups(
+                          GroupIds=[recorded_id]).get('SecurityGroups', [])
+                  except Exception as error:
+                      if error_code(error) != 'InvalidGroup.NotFound':
+                          raise
+              if not groups:
+                  groups = ec2.describe_security_groups(
+                      Filters=ownership_filters(stack_id, source_server_id,
+                                                replication_server_id)
+                  ).get('SecurityGroups', [])
+              group = one_or_none(groups, 'security-group')
+              if group:
+                  verify_owned(group, stack_id, source_server_id,
+                               replication_server_id, 'security-group')
+                  if group.get('VpcId') != vpc_id:
+                      raise ValueError('ConfigurationMismatch:security-group-vpc')
+              return group
+
+          def ensure_vxlan_ingress(group_id, source_ip):
+              try:
+                  ec2.authorize_security_group_ingress(
+                      GroupId=group_id,
+                      IpPermissions=[{
+                          'IpProtocol': 'udp', 'FromPort': 4789, 'ToPort': 4789,
+                          'IpRanges': [{'CidrIp': f'{source_ip}/32',
+                                       'Description': 'VXLAN from replication server'}]
+                      }]
+                  )
+              except Exception as error:
+                  if error_code(error) != 'InvalidPermission.Duplicate':
+                      raise
+
+          def ensure_https_only_egress(group_id):
+              """Replace EC2's default allow-all egress with portable HTTPS only.
+
+              This rule authorizes the protocol needed by SSM and Amazon Linux
+              repositories; it does not create NAT routes or VPC endpoints. A
+              private subnet still needs the documented repository/SSM path.
+              """
+              group = ec2.describe_security_groups(GroupIds=[group_id])[
+                  'SecurityGroups'][0]
+              current = group.get('IpPermissionsEgress', [])
+              desired = [{
+                  'IpProtocol': 'tcp', 'FromPort': 443, 'ToPort': 443,
+                  'IpRanges': [{
+                      'CidrIp': '0.0.0.0/0',
+                      'Description': 'HTTPS for SSM and package repositories'
+                  }]
+              }]
+
+              def normalized(permission):
+                  # DescribeSecurityGroups adds empty destination arrays that
+                  # are omitted from the authorize request. Normalize both
+                  # forms so duplicate events do not churn a correct rule.
+                  return {
+                      'IpProtocol': permission.get('IpProtocol'),
+                      'FromPort': permission.get('FromPort'),
+                      'ToPort': permission.get('ToPort'),
+                      'IpRanges': permission.get('IpRanges', []),
+                      'Ipv6Ranges': permission.get('Ipv6Ranges', []),
+                      'PrefixListIds': permission.get('PrefixListIds', []),
+                      'UserIdGroupPairs': permission.get(
+                          'UserIdGroupPairs', [])
+                  }
+
+              if ([normalized(item) for item in current] ==
+                      [normalized(item) for item in desired]):
+                  return
+              if current:
+                  ec2.revoke_security_group_egress(
+                      GroupId=group_id, IpPermissions=current)
+              try:
+                  ec2.authorize_security_group_egress(
+                      GroupId=group_id, IpPermissions=desired)
+              except Exception as error:
+                  if error_code(error) != 'InvalidPermission.Duplicate':
+                      raise
+
+          def find_target_instance(recorded_id, stack_id, source_server_id,
+                                   replication_server_id, subnet_id, group_id):
+              instances = []
+              if recorded_id:
+                  try:
+                      response = ec2.describe_instances(InstanceIds=[recorded_id])
+                      instances = [item for reservation in response.get('Reservations', [])
+                                   for item in reservation.get('Instances', [])]
+                      # A prior rollback may have physically terminated the target
+                      # before inventory reconciliation completed. Treat that exact
+                      # terminal instance as absent so retry can create a replacement.
+                      if instances and all(
+                              item.get('State', {}).get('Name') == 'terminated'
+                              for item in instances):
+                          instances = []
+                  except Exception as error:
+                      if error_code(error) != 'InvalidInstanceID.NotFound':
+                          raise
+              if not instances:
+                  response = ec2.describe_instances(Filters=(
+                      ownership_filters(stack_id, source_server_id,
+                                        replication_server_id) + [
+                          {'Name': 'tag:MirrorTarget', 'Values': ['true']},
+                          {'Name': 'instance-state-name',
+                           'Values': ['pending', 'running']}
+                      ]))
+                  instances = [item for reservation in response.get('Reservations', [])
+                               for item in reservation.get('Instances', [])]
+              instance = one_or_none(instances, 'target-instance')
+              if instance:
+                  state = instance.get('State', {}).get('Name')
+                  if state not in ('pending', 'running'):
+                      raise ValueError('ConfigurationMismatch:target-instance-state')
+                  verify_owned(instance, stack_id, source_server_id,
+                               replication_server_id, 'target-instance')
+                  if instance.get('SubnetId') != subnet_id:
+                      raise ValueError('ConfigurationMismatch:target-subnet')
+                  group_ids = {item['GroupId'] for item in
+                               instance.get('SecurityGroups', [])}
+                  if group_id not in group_ids:
+                      raise ValueError('ConfigurationMismatch:target-security-group')
+              return instance
+
+          def find_mirror_target(recorded_id, stack_id, source_server_id,
+                                 replication_server_id, network_interface_id):
+              targets = []
+              if recorded_id:
+                  try:
+                      targets = ec2.describe_traffic_mirror_targets(
+                          TrafficMirrorTargetIds=[recorded_id]
+                      ).get('TrafficMirrorTargets', [])
+                  except Exception as error:
+                      if not is_not_found(error):
+                          raise
+              if not targets:
+                  targets = ec2.describe_traffic_mirror_targets(
+                      Filters=ownership_filters(stack_id, source_server_id,
+                                                replication_server_id)
+                  ).get('TrafficMirrorTargets', [])
+              target = one_or_none(targets, 'traffic-mirror-target')
+              if target:
+                  verify_owned(target, stack_id, source_server_id,
+                               replication_server_id, 'traffic-mirror-target')
+                  if target.get('NetworkInterfaceId') != network_interface_id:
+                      raise ValueError('ConfigurationMismatch:mirror-target-eni')
+              return target
+
+          def find_mirror_filter(recorded_id, stack_id, source_server_id,
+                                 replication_server_id):
+              filters = []
+              if recorded_id:
+                  try:
+                      filters = ec2.describe_traffic_mirror_filters(
+                          TrafficMirrorFilterIds=[recorded_id]
+                      ).get('TrafficMirrorFilters', [])
+                  except Exception as error:
+                      if not is_not_found(error):
+                          raise
+              if not filters:
+                  filters = ec2.describe_traffic_mirror_filters(
+                      Filters=ownership_filters(stack_id, source_server_id,
+                                                replication_server_id)
+                  ).get('TrafficMirrorFilters', [])
+              mirror_filter = one_or_none(filters, 'traffic-mirror-filter')
+              if mirror_filter:
+                  verify_owned(mirror_filter, stack_id, source_server_id,
+                               replication_server_id, 'traffic-mirror-filter')
+              return mirror_filter
+
+          def desired_filter_rules():
+              # The MGN/DRS replication server is service-managed and cannot be
+              # accessed directly. Troubleshooting must observe the complete IPv4
+              # network behavior of its ENI: source-server replication traffic,
+              # return traffic, DNS/control traffic, and connectivity from the RS
+              # to MGN/DRS service endpoints. Restricting the mirror to TCP/1500
+              # would hide endpoint-side failures, so both directions intentionally
+              # accept all IPv4 protocols and ports. tcpdump remains operator-run,
+              # host-scoped, size-rotated, and stored on encrypted disk.
+              return [
+                  {'TrafficDirection': 'ingress',
+                   'SourceCidrBlock': '0.0.0.0/0',
+                   'DestinationCidrBlock': '0.0.0.0/0'},
+                  {'TrafficDirection': 'egress',
+                   'SourceCidrBlock': '0.0.0.0/0',
+                   'DestinationCidrBlock': '0.0.0.0/0'}
+              ]
+
+          def comparable_rule(rule):
+              keys = ['TrafficDirection', 'SourceCidrBlock',
+                      'DestinationCidrBlock', 'Protocol',
+                      'SourcePortRange', 'DestinationPortRange']
+              return {key: rule[key] for key in keys if key in rule}
+
+          def ensure_filter_rules(mirror_filter):
+              desired = desired_filter_rules()
+              existing = (mirror_filter.get('IngressFilterRules', []) +
+                          mirror_filter.get('EgressFilterRules', []))
+              existing_rules = [comparable_rule(item) for item in existing
+                                if item.get('RuleAction') == 'accept']
+              for spec in desired:
+                  if comparable_rule(spec) not in existing_rules:
+                      ec2.create_traffic_mirror_filter_rule(
+                          TrafficMirrorFilterId=mirror_filter['TrafficMirrorFilterId'],
+                          RuleNumber=100,
+                          RuleAction='accept',
+                          **spec
+                      )
+              # Refetch and require exactly the two intended all-IPv4 accept
+              # rules. Unexpected accept rules are refused rather than reused.
+              refreshed = ec2.describe_traffic_mirror_filters(
+                  TrafficMirrorFilterIds=[mirror_filter['TrafficMirrorFilterId']]
+              )['TrafficMirrorFilters'][0]
+              actual = [comparable_rule(item) for item in
+                        refreshed.get('IngressFilterRules', []) +
+                        refreshed.get('EgressFilterRules', [])
+                        if item.get('RuleAction') == 'accept']
+              normalize = lambda item: json.dumps(item, sort_keys=True, separators=(',', ':'))
+              if sorted(map(normalize, actual)) != sorted(map(normalize, desired)):
+                  raise ValueError('ConfigurationMismatch:mirror-filter-rules')
+              return refreshed
+
+          def next_available_session_number(source_eni):
+              sessions = ec2.describe_traffic_mirror_sessions(
+                  Filters=[{
+                      'Name': 'network-interface-id',
+                      'Values': [source_eni]
+                  }]
+              ).get('TrafficMirrorSessions', [])
+              used = {
+                  item.get('SessionNumber')
+                  for item in sessions
+                  if item.get('SessionNumber') is not None
+              }
+              for candidate in range(1, 32767):
+                  if candidate not in used:
+                      return candidate
+              raise ValueError('NoAvailableTrafficMirrorSessionNumber')
+
+          def find_mirror_session(recorded_id, stack_id, source_server_id,
+                                  replication_server_id, source_eni,
+                                  target_id, filter_id):
+              sessions = []
+              if recorded_id:
+                  try:
+                      sessions = ec2.describe_traffic_mirror_sessions(
+                          TrafficMirrorSessionIds=[recorded_id]
+                      ).get('TrafficMirrorSessions', [])
+                  except Exception as error:
+                      if not is_not_found(error):
+                          raise
+              if not sessions:
+                  sessions = ec2.describe_traffic_mirror_sessions(
+                      Filters=ownership_filters(stack_id, source_server_id,
+                                                replication_server_id)
+                  ).get('TrafficMirrorSessions', [])
+              session = one_or_none(sessions, 'traffic-mirror-session')
+              if session:
+                  verify_owned(session, stack_id, source_server_id,
+                               replication_server_id, 'traffic-mirror-session')
+                  expected = (source_eni, target_id, filter_id)
+                  actual = (session.get('NetworkInterfaceId'),
+                            session.get('TrafficMirrorTargetId'),
+                            session.get('TrafficMirrorFilterId'))
+                  if actual != expected:
+                      raise ValueError('ConfigurationMismatch:mirror-session')
+              return session
+
+          def remaining_seconds(context):
+              return context.get_remaining_time_in_millis() / 1000.0
+
+          def require_time(context, reserve_seconds, operation):
+              if remaining_seconds(context) <= reserve_seconds:
+                  raise TimeoutError(f'TimeBudgetReserved:{operation}')
+
+          def wait_for_instance_running(instance_id, context):
+              for _ in range(30):
+                  require_time(context, 120, 'InstanceRunning')
+                  try:
+                      response = ec2.describe_instances(InstanceIds=[instance_id])
+                  except Exception as error:
+                      if error_code(error) == 'InvalidInstanceID.NotFound':
+                          time.sleep(5)
+                          continue
+                      raise
+                  instances = [
+                      item for reservation in response.get('Reservations', [])
+                      for item in reservation.get('Instances', [])
+                  ]
+                  if not instances:
+                      time.sleep(5)
+                      continue
+                  state = instances[0].get('State', {}).get('Name')
+                  if state == 'running':
+                      return
+                  if state in ('shutting-down', 'terminated', 'stopping', 'stopped'):
+                      raise ValueError('TargetInstanceEnteredTerminalState')
+                  time.sleep(10)
+              raise TimeoutError('InstanceRunningNotVerified')
+
+          def wait_for_verified_termination(instance_id, context):
+              for _ in range(30):
+                  require_time(context, 45, 'InstanceTermination')
+                  try:
+                      response = ec2.describe_instances(InstanceIds=[instance_id])
+                  except Exception as error:
+                      if error_code(error) == 'InvalidInstanceID.NotFound':
+                          return
+                      raise
+                  states = [
+                      item.get('State', {}).get('Name')
+                      for reservation in response.get('Reservations', [])
+                      for item in reservation.get('Instances', [])
+                  ]
+                  if not states or all(state == 'terminated' for state in states):
+                      return
+                  time.sleep(10)
+              raise TimeoutError('InstanceTerminationNotVerified')
+
+          def delete_security_group_with_retry(group_id, context):
+              for _ in range(12):
+                  require_time(context, 45, 'SecurityGroupDeletion')
+                  try:
+                      ec2.delete_security_group(GroupId=group_id)
+                      return
+                  except Exception as error:
+                      code = error_code(error)
+                      if code == 'InvalidGroup.NotFound':
+                          return
+                      if code != 'DependencyViolation':
+                          raise
+                  time.sleep(5)
+              raise TimeoutError('SecurityGroupDeletionNotVerified')
+
+          INVENTORY_KEYS = {
+              'security-group': 'SecurityGroupId',
+              'target-instance': 'TargetInstanceId',
+              'traffic-mirror-target': 'MirrorTargetId',
+              'traffic-mirror-filter': 'MirrorFilterId',
+              'traffic-mirror-session': 'MirrorSessionId'
+          }
+
+          def rollback_created(created, record, document, parameter_name, context):
+              failures = []
+              for kind, resource_id in reversed(created):
+                  try:
+                      if kind == 'traffic-mirror-session':
+                          ec2.delete_traffic_mirror_session(
+                              TrafficMirrorSessionId=resource_id)
+                      elif kind == 'traffic-mirror-target':
+                          ec2.delete_traffic_mirror_target(
+                              TrafficMirrorTargetId=resource_id)
+                      elif kind == 'traffic-mirror-filter':
+                          ec2.delete_traffic_mirror_filter(
+                              TrafficMirrorFilterId=resource_id)
+                      elif kind == 'target-instance':
+                          ec2.terminate_instances(InstanceIds=[resource_id])
+                          wait_for_verified_termination(resource_id, context)
+                          record.pop('TargetLaunchToken', None)
+                      elif kind == 'security-group':
+                          delete_security_group_with_retry(resource_id, context)
+                      key = INVENTORY_KEYS[kind]
+                      if record.get(key) == resource_id:
+                          record.pop(key, None)
+                      if kind == 'target-instance':
+                          record.pop('TargetNetworkInterfaceId', None)
+                      save_inventory(parameter_name, document)
+                  except StackDeletingError:
+                      # Cleanup may mark DELETING between a resource deletion and
+                      # inventory persistence. Never overwrite that marker. Leave
+                      # the exact ID in inventory; cleanup will reconcile the now-
+                      # absent resource through its not-found path.
+                      logger.info(
+                          'Rollback removed kind=%s id=%s after DELETING; '
+                          'inventory retained for cleanup reconciliation',
+                          kind, resource_id)
+                  except Exception as error:
+                      details = safe_error(error)
+                      failures.append({'Kind': kind, 'Error': details})
+                      logger.error(
+                          'Rollback incomplete kind=%s id=%s details=%s',
+                          kind, resource_id, details)
+              return failures
+
+          def create_security_group(vpc_id, source_ip, stack_name, stack_id,
+                                    source_server_id, replication_server_id):
+              """Create a stack-owned SG allowing VXLAN from the replication server."""
+              identity = hashlib.sha256(f'{stack_id}|{source_server_id}|{replication_server_id}|sg'.encode()).hexdigest()[:12]
+              sg_name = f'{stack_name}-MirrorSG-{identity}'
+              
+              response = ec2.create_security_group(
+                  GroupName=sg_name,
+                  Description=f'Traffic mirroring SG for {source_server_id}',
+                  VpcId=vpc_id,
+                  TagSpecifications=[{
+                      'ResourceType': 'security-group',
+                      'Tags': [
+                          {'Key': 'Name', 'Value': sg_name},
+                          {'Key': 'StackName', 'Value': stack_name},
+                          {'Key': 'StackId', 'Value': stack_id},
+                          {'Key': 'SourceServerId', 'Value': source_server_id},
+                          {'Key': 'ReplicationServerId', 'Value': replication_server_id}
+                      ]
+                  }]
+              )
+              sg_id = response['GroupId']
+              logger.info(f"Created security group: {sg_id}")
+              return sg_id
+
+          def lambda_handler(event, context):
+              try:
+                  # Log only allowlisted event metadata; never the full envelope.
+                  logger.info("Invocation requestId=%s detailType=%s",
+                              context.aws_request_id, event.get('detail-type', 'unknown'))
+                  
+                  # Get config from environment
+                  ami_id = os.environ['AMI_ID']
+                  instance_type = os.environ['INSTANCE_TYPE']
+                  stack_name = os.environ['STACK_NAME']
+                  stack_id = os.environ['STACK_ID']
+                  iam_profile = os.environ['IAM_INSTANCE_PROFILE']
+                  expected_source_server = os.environ['SOURCE_SERVER_ID']
+                  replication_service = os.environ['REPLICATION_SERVICE']
+                  assign_public_ip = os.environ.get('ASSIGN_PUBLIC_IP', 'false').lower() == 'true'
+                  inventory_parameter = os.environ['INVENTORY_PARAMETER']
+                  created_this_attempt = []
+                  inventory_document = None
+                  inventory_record = None
+                  
+                  # Extract instance ID from event
+                  instance_id = event.get('detail', {}).get('instance-id')
+                  if not instance_id:
+                      logger.info("No instance-id in event")
+                      return {'statusCode': 200, 'body': 'No instance-id'}
+                  
+                  logger.info(f"Checking instance: {instance_id}")
+                  
+                  # The event may be delayed until the instance has disappeared or
+                  # entered a terminal state. Treat that as a safe non-match rather
+                  # than consuming async retries or DLQ capacity.
+                  try:
+                      instance_info = ec2.describe_instances(InstanceIds=[instance_id])
+                  except Exception as error:
+                      if error_code(error) == 'InvalidInstanceID.NotFound':
+                          logger.info("Event instance no longer exists")
+                          return {'statusCode': 200, 'body': 'Instance no longer exists'}
+                      raise
+                  instances = [
+                      item for reservation in instance_info.get('Reservations', [])
+                      for item in reservation.get('Instances', [])
+                  ]
+                  if not instances or instances[0].get('State', {}).get('Name') != 'running':
+                      logger.info("Event instance is not running")
+                      return {'statusCode': 200, 'body': 'Instance not running'}
+                  instance = instances[0]
+                  tags = {t['Key']: t['Value'] for t in instance.get('Tags', [])}
+                  
+                  # Accept only a replication server carrying both this source
+                  # marker and this stack's exact ownership ID. Other stacks'
+                  # EventBridge rules receive the same account-wide events but
+                  # reject the instance here.
+                  expected_tag = f"Mirroring-{expected_source_server}"
+                  if (tags.get(expected_tag, '').lower() != 'yes' or
+                          tags.get('MirroringStackId') != stack_id):
+                      logger.info(f"Instance {instance_id} is not owned by this stack")
+                      return {'statusCode': 200, 'body': 'Not this stack ownership'}
+                  
+                  # MGN exposes the selected source's authoritative
+                  # replication server ID. Reject a correctly tagged substitute
+                  # before inventory or any generated resource is modified.
+                  if not mgn_replicator_matches(
+                          replication_service, expected_source_server,
+                          instance_id, context):
+                      logger.warning(
+                          "Tagged MGN candidate is not the selected source replicator")
+                      return {'statusCode': 200,
+                              'body': 'MGN replicator mismatch'}
+
+                  expected_subnet = get_expected_staging_subnet(
+                      replication_service, expected_source_server)
+                  if instance.get('SubnetId') != expected_subnet:
+                      logger.warning(
+                          "Tagged candidate is outside the configured staging subnet")
+                      return {'statusCode': 200,
+                              'body': 'Replication subnet mismatch'}
+
+                  logger.info(f"Found matching replication server for {expected_source_server}")
+                  
+                  # Load durable progress before creating anything. Exact IDs
+                  # are persisted after every stage so retries can resume safely.
+                  inventory_document, inventory_record = load_inventory(
+                      inventory_parameter, stack_id, expected_source_server,
+                      instance_id)
+                  inventory_document['ActiveInvocationId'] = context.aws_request_id
+                  inventory_document['ActiveInvocationExpiresAt'] = int(time.time()) + 600
+                  save_inventory(inventory_parameter, inventory_document)
+                  
+                  # Get replication server details - ALWAYS use same VPC/subnet
+                  rs_details = get_instance_details(instance_id)
+                  vpc_id = rs_details['vpc_id']
+                  subnet_id = rs_details['subnet_id']
+                  
+                  logger.info("Replication server network context retrieved")
+                  
+                  # Create or reuse the exact owned security group.
+                  ensure_active(inventory_parameter)
+                  require_time(context, 180, 'SecurityGroupCreation')
+                  group = find_security_group(
+                      inventory_record.get('SecurityGroupId'), stack_id,
+                      expected_source_server, instance_id, vpc_id)
+                  if group:
+                      sg_id = group['GroupId']
+                  else:
+                      sg_id = create_security_group(
+                          vpc_id, rs_details['private_ip'], stack_name, stack_id,
+                          expected_source_server, instance_id)
+                      created_this_attempt.append(('security-group', sg_id))
+                  ensure_vxlan_ingress(sg_id, rs_details['private_ip'])
+                  ensure_https_only_egress(sg_id)
+                  inventory_record['SecurityGroupId'] = sg_id
+                  save_inventory(inventory_parameter, inventory_document)
+                  
+                  # Launch mirror target instance in SAME VPC/subnet as RS
+                  logger.info("Launching mirror target instance...")
+                  
+                  # UserData script to install tcpdump and configure for packet capture
+                  user_data_script = f'''#!/bin/bash
+          set -e
+          
+          # Log startup
+          exec > >(tee /var/log/user-data.log) 2>&1
+          echo "Starting mirror target instance setup..."
+          
+          # Install only the required capture package. Avoid a full OS update at
+          # boot, which adds delay and unnecessary package drift. HTTPS egress
+          # authorization does not create a route: a private subnet still needs
+          # NAT/proxy or a verified private repository path. Bound the attempt so
+          # a missing path fails cloud-init promptly instead of hanging forever.
+          if ! timeout 300 dnf install -y tcpdump; then
+              echo "tcpdump installation failed; verify Amazon Linux repository connectivity" >&2
+              exit 1
+          fi
+          
+          # Keep scripts and reference data root-owned. tcpdump drops privileges
+          # to its service account before opening rotated output files, so give
+          # that account a separate, restricted directory for pcap output.
+          install -d -o root -g root -m 755 /var/lib/traffic-capture
+          install -d -o tcpdump -g tcpdump -m 750 /var/lib/traffic-capture/captures
+          
+          # Store replication server IP for easy reference
+          echo "{rs_details['private_ip']}" > /var/lib/traffic-capture/replication-server-ip.txt
+          chmod 644 /var/lib/traffic-capture/replication-server-ip.txt
+          
+          # Create helper script for quick tcpdump
+          cat > /var/lib/traffic-capture/capture-traffic.sh << 'SCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          # Capture traffic to/from the replication server, with bounded rotation
+          # so the disk cannot fill: each file is capped at 100 MB (-C 100) and at
+          # most 5 files are kept, rotating oldest-out (-W 5) = ~500 MB ceiling.
+          # The default filter is scoped to the replication server host only.
+          RS_IP=$(cat /var/lib/traffic-capture/replication-server-ip.txt)
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          OUTPUT_FILE="/var/lib/traffic-capture/captures/capture-$TIMESTAMP.pcap"
+          LOCK_FILE="/run/traffic-capture.lock"
+
+          exec 9>"$LOCK_FILE"
+          if ! flock -n 9; then
+              echo "Another managed capture is already running" >&2
+              exit 1
+          fi
+
+          # Keep the helper-managed aggregate ceiling at one five-file set.
+          # The operator must review/delete the prior set before starting another.
+          if find /var/lib/traffic-capture/captures -maxdepth 1 \
+                  -type f -name '*.pcap*' -print -quit | grep -q .; then
+              echo "Existing capture files found. Review and delete them before a new run." >&2
+              exit 1
+          fi
+          
+          echo "Capturing traffic from replication server: $RS_IP"
+          echo "Output file(s): $OUTPUT_FILE[0-4] (rotating, max 5 x 100MB per capture run)"
+          echo "Press Ctrl+C when you want to stop the capture"
+          echo ""
+
+          tcpdump -Z tcpdump -nn -tt -vv host "$RS_IP" -C 100 -W 5 -w "$OUTPUT_FILE"
+          SCRIPT
+          chmod 755 /var/lib/traffic-capture/capture-traffic.sh
+          
+          # Create quick view script (no file, just console output)
+          cat > /var/lib/traffic-capture/view-traffic.sh << 'SCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          RS_IP=$(cat /var/lib/traffic-capture/replication-server-ip.txt)
+          echo "Viewing live traffic from replication server: $RS_IP"
+          echo "Press Ctrl+C to stop"
+          echo ""
+          tcpdump -Z tcpdump -nn -tt -vv host "$RS_IP"
+          SCRIPT
+          chmod 755 /var/lib/traffic-capture/view-traffic.sh
+          
+          echo "Setup complete!"
+          echo "Quick commands:"
+          echo "  /var/lib/traffic-capture/capture-traffic.sh  - Capture to rotating pcap files"
+          echo "  /var/lib/traffic-capture/view-traffic.sh     - View live traffic"
+          echo "  Capture directory: /var/lib/traffic-capture/captures"
+          echo "  Replication server IP: {rs_details['private_ip']}"
+          '''
+                  
+                  # boto3 performs the EC2 API base64 encoding. Passing a pre-encoded
+                  # value would make cloud-init decode only to base64 text and skip setup.
+                  user_data = user_data_script
+                  
+                  target_instance = find_target_instance(
+                      inventory_record.get('TargetInstanceId'), stack_id,
+                      expected_source_server, instance_id, subnet_id, sg_id)
+                  if target_instance:
+                      target_instance_id = target_instance['InstanceId']
+                  else:
+                      ensure_active(inventory_parameter)
+                      require_time(context, 180, 'TargetInstanceLaunch')
+                      launch_token = inventory_record.get('TargetLaunchToken')
+                      if not launch_token:
+                          launch_token = hashlib.sha256(
+                              (
+                                  f'{stack_id}|{expected_source_server}|{instance_id}|target|'
+                                  f'{ami_id}|{instance_type}|{subnet_id}|{sg_id}|'
+                                  f'{iam_profile}|{assign_public_ip}|{context.aws_request_id}'
+                              ).encode()
+                          ).hexdigest()[:64]
+                          inventory_record['TargetLaunchToken'] = launch_token
+                          save_inventory(inventory_parameter, inventory_document)
+                      response = ec2.run_instances(
+                          ClientToken=launch_token,
+                          ImageId=ami_id,
+                          InstanceType=instance_type,
+                          MinCount=1,
+                          MaxCount=1,
+                          NetworkInterfaces=[{
+                              'DeviceIndex': 0,
+                              'SubnetId': subnet_id,
+                              'Groups': [sg_id],
+                              'AssociatePublicIpAddress': assign_public_ip
+                          }],
+                          IamInstanceProfile={'Name': iam_profile},
+                          UserData=user_data,
+                          # Encrypt the root volume so captured pcap files written to
+                          # disk are encrypted at rest with the account's EBS default
+                          # (or AWS-managed) key.
+                          BlockDeviceMappings=[{
+                              'DeviceName': '/dev/xvda',
+                              'Ebs': {
+                                  'Encrypted': True,
+                                  'DeleteOnTermination': True,
+                                  'VolumeType': 'gp3'
+                              }
+                          }],
+                          # Require IMDSv2 (token-backed) and disable IMDSv1.
+                          MetadataOptions={
+                              'HttpTokens': 'required',
+                              'HttpEndpoint': 'enabled',
+                              'HttpPutResponseHopLimit': 1
+                          },
+                          TagSpecifications=[
+                              {
+                                  'ResourceType': 'instance',
+                                  'Tags': [
+                                      {'Key': 'Name', 'Value': f'{stack_name}-MirrorTarget-{expected_source_server[-8:]}'},
+                                      {'Key': 'MirrorTarget', 'Value': 'true'},
+                                      {'Key': 'StackName', 'Value': stack_name},
+                                      {'Key': 'StackId', 'Value': stack_id},
+                                      {'Key': 'SourceServerId', 'Value': expected_source_server},
+                                      {'Key': 'ReplicationServerId', 'Value': instance_id}
+                                  ]
+                              },
+                              {
+                                  'ResourceType': 'network-interface',
+                                  'Tags': [
+                                      {'Key': 'StackName', 'Value': stack_name},
+                                      {'Key': 'StackId', 'Value': stack_id},
+                                      {'Key': 'SourceServerId', 'Value': expected_source_server},
+                                      {'Key': 'ReplicationServerId', 'Value': instance_id}
+                                  ]
+                              },
+                              {
+                                  'ResourceType': 'volume',
+                                  'Tags': [
+                                      {'Key': 'StackName', 'Value': stack_name},
+                                      {'Key': 'StackId', 'Value': stack_id},
+                                      {'Key': 'SourceServerId', 'Value': expected_source_server},
+                                      {'Key': 'ReplicationServerId', 'Value': instance_id}
+                                  ]
+                              }
+                          ]
+                      )
+                  
+                      target_instance_id = response['Instances'][0]['InstanceId']
+                      created_this_attempt.append(('target-instance', target_instance_id))
+                  inventory_record['TargetInstanceId'] = target_instance_id
+                  inventory_record.pop('TargetLaunchToken', None)
+                  save_inventory(inventory_parameter, inventory_document)
+                  wait_for_instance_running(target_instance_id, context)
+                  require_time(context, 90, 'PostLaunchStabilization')
+                  time.sleep(10)
+                  target_details = get_instance_details(target_instance_id)
+                  
+                  # Create or reuse the exact owned mirror target.
+                  mirror_target = find_mirror_target(
+                      inventory_record.get('MirrorTargetId'), stack_id,
+                      expected_source_server, instance_id,
+                      target_details['network_interface_id'])
+                  if not mirror_target:
+                      ensure_active(inventory_parameter)
+                      require_time(context, 60, 'MirrorTargetCreation')
+                      response = ec2.create_traffic_mirror_target(
+                          NetworkInterfaceId=target_details['network_interface_id'],
+                          Description=f'Mirror target for source server {expected_source_server}',
+                          TagSpecifications=[{
+                              'ResourceType': 'traffic-mirror-target',
+                              'Tags': [
+                                  {'Key': 'Name', 'Value': f'{stack_name}-Target-{expected_source_server[-8:]}'},
+                                  {'Key': 'StackName', 'Value': stack_name},
+                                  {'Key': 'StackId', 'Value': stack_id},
+                                  {'Key': 'SourceServerId', 'Value': expected_source_server},
+                                  {'Key': 'ReplicationServerId', 'Value': instance_id}
+                              ]
+                          }]
+                      )
+                      mirror_target = response['TrafficMirrorTarget']
+                      created_this_attempt.append(
+                          ('traffic-mirror-target', mirror_target['TrafficMirrorTargetId']))
+                  mirror_target_id = mirror_target['TrafficMirrorTargetId']
+                  inventory_record['MirrorTargetId'] = mirror_target_id
+                  inventory_record['TargetNetworkInterfaceId'] = target_details['network_interface_id']
+                  save_inventory(inventory_parameter, inventory_document)
+                  
+                  # Create or reuse the exact owned mirror filter and verify
+                  # that its accept rules equal the selected capture scope.
+                  mirror_filter = find_mirror_filter(
+                      inventory_record.get('MirrorFilterId'), stack_id,
+                      expected_source_server, instance_id)
+                  if not mirror_filter:
+                      ensure_active(inventory_parameter)
+                      require_time(context, 60, 'MirrorFilterCreation')
+                      response = ec2.create_traffic_mirror_filter(
+                          Description=f'Mirror filter for {expected_source_server}',
+                          TagSpecifications=[{
+                              'ResourceType': 'traffic-mirror-filter',
+                              'Tags': [
+                                  {'Key': 'Name', 'Value': f'{stack_name}-Filter-{expected_source_server[-8:]}'},
+                                  {'Key': 'StackName', 'Value': stack_name},
+                                  {'Key': 'StackId', 'Value': stack_id},
+                                  {'Key': 'SourceServerId', 'Value': expected_source_server},
+                                  {'Key': 'ReplicationServerId', 'Value': instance_id}
+                              ]
+                          }]
+                      )
+                      mirror_filter = response['TrafficMirrorFilter']
+                      created_this_attempt.append(
+                          ('traffic-mirror-filter', mirror_filter['TrafficMirrorFilterId']))
+                  mirror_filter = ensure_filter_rules(mirror_filter)
+                  filter_id = mirror_filter['TrafficMirrorFilterId']
+                  inventory_record['MirrorFilterId'] = filter_id
+                  inventory_record['FilterScope'] = 'AllIPv4'
+                  save_inventory(inventory_parameter, inventory_document)
+                  
+                  # Create or reuse the exact owned mirror session.
+                  mirror_session = find_mirror_session(
+                      inventory_record.get('MirrorSessionId'), stack_id,
+                      expected_source_server, instance_id,
+                      rs_details['network_interface_id'], mirror_target_id,
+                      filter_id)
+                  if not mirror_session:
+                      ensure_active(inventory_parameter)
+                      require_time(context, 60, 'MirrorSessionCreation')
+                      response = ec2.create_traffic_mirror_session(
+                          NetworkInterfaceId=rs_details['network_interface_id'],
+                          TrafficMirrorTargetId=mirror_target_id,
+                          TrafficMirrorFilterId=filter_id,
+                          SessionNumber=next_available_session_number(
+                              rs_details['network_interface_id']),
+                          Description=f'Mirror session for {expected_source_server}',
+                          TagSpecifications=[{
+                              'ResourceType': 'traffic-mirror-session',
+                              'Tags': [
+                                  {'Key': 'Name', 'Value': f'{stack_name}-Session-{expected_source_server[-8:]}'},
+                                  {'Key': 'StackName', 'Value': stack_name},
+                                  {'Key': 'StackId', 'Value': stack_id},
+                                  {'Key': 'SourceServerId', 'Value': expected_source_server},
+                                  {'Key': 'ReplicationServerId', 'Value': instance_id}
+                              ]
+                          }]
+                      )
+                      mirror_session = response['TrafficMirrorSession']
+                      created_this_attempt.append(
+                          ('traffic-mirror-session', mirror_session['TrafficMirrorSessionId']))
+                  inventory_record['MirrorSessionId'] = mirror_session['TrafficMirrorSessionId']
+                  save_inventory(inventory_parameter, inventory_document)
+                  
+                  result = {
+                      'message': 'Traffic mirroring configured successfully!',
+                      'sourceServerId': expected_source_server,
+                      'replicationServerId': instance_id,
+                      'mirrorTargetInstanceId': target_instance_id,
+                      'mirrorTargetId': mirror_target_id,
+                      'mirrorFilterId': filter_id,
+                      'mirrorSessionId': mirror_session['TrafficMirrorSessionId']
+                  }
+                  
+                  logger.info("Mirroring setup succeeded source=%s replicationServer=%s session=%s",
+                              expected_source_server, instance_id,
+                              mirror_session['TrafficMirrorSessionId'])
+                  clear_active_invocation(
+                      inventory_parameter, context.aws_request_id)
+                  return {'statusCode': 200, 'body': json.dumps(result)}
+                  
+              except StackDeletingError:
+                  rollback_failures = []
+                  if created_this_attempt and inventory_record is not None:
+                      rollback_failures = rollback_created(
+                          created_this_attempt, inventory_record,
+                          inventory_document, inventory_parameter, context)
+                  if inventory_document is not None:
+                      try:
+                          clear_active_invocation(
+                              inventory_parameter, context.aws_request_id)
+                      except Exception as clear_error:
+                          details = safe_error(clear_error)
+                          rollback_failures.append({
+                              'Kind': 'active-invocation-marker',
+                              'Error': details
+                          })
+                          logger.error(
+                              "Active invocation marker clear failed details=%s",
+                              details)
+                  if rollback_failures:
+                      failure = {
+                          'Type': 'RollbackError',
+                          'Code': 'RollbackIncomplete',
+                          'Operation': 'rollback',
+                          'FailureCount': len(rollback_failures)
+                      }
+                      logger.error(
+                          "Setup observed DELETING but rollback was incomplete "
+                          "details=%s", failure)
+                      raise RuntimeError(
+                          json.dumps(failure, sort_keys=True)) from None
+                  logger.info("Stack lifecycle is DELETING; setup stopped")
+                  return {'statusCode': 200, 'body': 'Stack deleting'}
+              except Exception as e:
+                  rollback_failures = []
+                  if created_this_attempt and inventory_record is not None:
+                      rollback_failures = rollback_created(
+                          created_this_attempt, inventory_record,
+                          inventory_document, inventory_parameter, context)
+                  if inventory_document is not None:
+                      try:
+                          clear_active_invocation(
+                              inventory_parameter, context.aws_request_id)
+                      except Exception as clear_error:
+                          clear_details = safe_error(clear_error)
+                          rollback_failures.append({
+                              'Kind': 'active-invocation-marker',
+                              'Error': clear_details
+                          })
+                          logger.error(
+                              "Active invocation marker clear failed details=%s",
+                              clear_details)
+                  # Re-raise so EventBridge treats this async invocation as failed
+                  # and retries. If rollback was incomplete, surface that fact
+                  # after all reverse-order attempts without logging resource IDs
+                  # in the raised error payload. Exact IDs remain in inventory.
+                  details = safe_error(e)
+                  if rollback_failures:
+                      details['Rollback'] = {
+                          'Code': 'RollbackIncomplete',
+                          'FailureCount': len(rollback_failures)
+                      }
+                  logger.error("Mirroring setup failed requestId=%s details=%s",
+                               context.aws_request_id, details)
+                  raise RuntimeError(json.dumps(details, sort_keys=True)) from None
+
+  #============================================================================
+  # STEP 5: Cleanup Lambda - Delete mirroring resources on stack deletion
+  #============================================================================
+  
+  CleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-Cleanup"
+      RetentionInDays: 14
+
+  CleanupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CleanupLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-Cleanup"
+      Description: "Cleans up traffic mirroring resources on stack deletion"
+      Handler: index.handler
+      Role: !GetAtt CleanupExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          SOURCE_SERVER_ID: !Ref SourceServerId
+          STACK_ID: !Ref AWS::StackId
+          INVENTORY_PARAMETER: !Ref MirroringInventoryParameter
+          LIFECYCLE_PARAMETER: !Ref MirroringLifecycleParameter
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import contextlib
+          import io
+
+          _cfnresponse_send = cfnresponse.send
+
+          def quiet_cfnresponse_send(*args, **kwargs):
+              # The runtime helper prints the complete CloudFormation response
+              # body. Preserve its delivery behavior while discarding that
+              # unnecessary infrastructure metadata from Lambda logs.
+              with contextlib.redirect_stdout(io.StringIO()):
+                  with contextlib.redirect_stderr(io.StringIO()):
+                      return _cfnresponse_send(*args, **kwargs)
+
+          cfnresponse.send = quiet_cfnresponse_send
+          import json
+          import logging
+          import time
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ec2 = boto3.client('ec2')
+          ssm = boto3.client('ssm')
+
+          def error_code(error):
+              response = getattr(error, 'response', {}) or {}
+              return (response.get('Error', {}) or {}).get('Code', '')
+
+          def is_not_found(error):
+              return 'NotFound' in error_code(error)
+
+          def safe_error(error):
+              return f"{type(error).__name__}:{error_code(error) or 'UnhandledError'}:{getattr(error, 'operation_name', 'unknown')}"
+
+          def release_source_lock(parameter_name, stack_id):
+              try:
+                  current = ssm.get_parameter(Name=parameter_name)
+              except Exception as error:
+                  if error_code(error) == 'ParameterNotFound':
+                      return
+                  raise
+              if current['Parameter'].get('Value') == stack_id:
+                  ssm.delete_parameter(Name=parameter_name)
+
+          def tags_dict(resource):
+              return {tag['Key']: tag['Value'] for tag in resource.get('Tags', [])}
+
+          def verify_owned(resource, stack_id, source_server_id,
+                           replication_server_id, label):
+              tags = tags_dict(resource)
+              expected = {
+                  'StackId': stack_id,
+                  'SourceServerId': source_server_id,
+                  'ReplicationServerId': replication_server_id
+              }
+              if any(tags.get(key) != value for key, value in expected.items()):
+                  raise ValueError(f"OwnershipMismatch:{label}")
+
+          def load_inventory(parameter_name, stack_id, source_server_id):
+              response = ssm.get_parameter(Name=parameter_name)
+              raw = response['Parameter'].get('Value', '{}')
+              document = json.loads(raw) if raw else {}
+              if not document:
+                  return {'Version': 1, 'StackId': stack_id,
+                          'SourceServerId': source_server_id,
+                          'LifecycleState': 'ACTIVE', 'Deployments': {}}
+              if (document.get('StackId') != stack_id or
+                      document.get('SourceServerId') != source_server_id):
+                  raise ValueError('InventoryOwnershipMismatch')
+              document.setdefault('LifecycleState', 'ACTIVE')
+              return document
+
+          def save_inventory(parameter_name, document):
+              ssm.put_parameter(
+                  Name=parameter_name, Type='String', Overwrite=True,
+                  Value=json.dumps(document, separators=(',', ':'), sort_keys=True))
+
+          def describe_session(resource_id):
+              try:
+                  return ec2.describe_traffic_mirror_sessions(
+                      TrafficMirrorSessionIds=[resource_id]
+                  ).get('TrafficMirrorSessions', [])
+              except Exception as error:
+                  if is_not_found(error):
+                      return []
+                  raise
+
+          def describe_target(resource_id):
+              try:
+                  return ec2.describe_traffic_mirror_targets(
+                      TrafficMirrorTargetIds=[resource_id]
+                  ).get('TrafficMirrorTargets', [])
+              except Exception as error:
+                  if is_not_found(error):
+                      return []
+                  raise
+
+          def describe_filter(resource_id):
+              try:
+                  return ec2.describe_traffic_mirror_filters(
+                      TrafficMirrorFilterIds=[resource_id]
+                  ).get('TrafficMirrorFilters', [])
+              except Exception as error:
+                  if is_not_found(error):
+                      return []
+                  raise
+
+          def describe_instance(resource_id):
+              try:
+                  response = ec2.describe_instances(InstanceIds=[resource_id])
+              except Exception as error:
+                  if error_code(error) == 'InvalidInstanceID.NotFound':
+                      return []
+                  raise
+              return [item for reservation in response.get('Reservations', [])
+                      for item in reservation.get('Instances', [])]
+
+          def describe_group(resource_id):
+              try:
+                  return ec2.describe_security_groups(
+                      GroupIds=[resource_id]).get('SecurityGroups', [])
+              except Exception as error:
+                  if error_code(error) == 'InvalidGroup.NotFound':
+                      return []
+                  raise
+
+          def discovery_filters(stack_id, source_server_id):
+              return [
+                  {'Name': 'tag:StackId', 'Values': [stack_id]},
+                  {'Name': 'tag:SourceServerId', 'Values': [source_server_id]}
+              ]
+
+          def merge_discovered(deployments, resource, id_key, resource_id,
+                               stack_id, source_server_id, label):
+              tags = tags_dict(resource)
+              if (tags.get('StackId') != stack_id or
+                      tags.get('SourceServerId') != source_server_id):
+                  raise ValueError(f'OwnershipMismatch:{label}')
+              replication_server_id = tags.get('ReplicationServerId')
+              if not replication_server_id:
+                  raise ValueError(f'MissingReplicationServerId:{label}')
+              record = deployments.setdefault(replication_server_id, {})
+              existing_id = record.get(id_key)
+              if existing_id and existing_id != resource_id:
+                  raise ValueError(f'DuplicateOwnedResources:{label}')
+              record[id_key] = resource_id
+
+          def discover_owned_resources(inventory, stack_id, source_server_id):
+              """Reconstruct missing inventory IDs from atomic create-time tags."""
+              deployments = inventory.setdefault('Deployments', {})
+              filters = discovery_filters(stack_id, source_server_id)
+
+              groups = ec2.describe_security_groups(
+                  Filters=filters).get('SecurityGroups', [])
+              # EC2 can return terminated instances for about an hour.
+              # Exclude them so a replaced target is not misclassified as a
+              # duplicate while retaining every state that cleanup may need.
+              instance_filters = filters + [{
+                  'Name': 'instance-state-name',
+                  'Values': ['pending', 'running', 'shutting-down',
+                             'stopping', 'stopped']
+              }]
+              instances_response = ec2.describe_instances(
+                  Filters=instance_filters)
+              instances = [
+                  item
+                  for reservation in instances_response.get('Reservations', [])
+                  for item in reservation.get('Instances', [])
+              ]
+              targets = ec2.describe_traffic_mirror_targets(
+                  Filters=filters).get('TrafficMirrorTargets', [])
+              mirror_filters = ec2.describe_traffic_mirror_filters(
+                  Filters=filters).get('TrafficMirrorFilters', [])
+              sessions = ec2.describe_traffic_mirror_sessions(
+                  Filters=filters).get('TrafficMirrorSessions', [])
+
+              for resource in groups:
+                  merge_discovered(
+                      deployments, resource, 'SecurityGroupId',
+                      resource['GroupId'], stack_id, source_server_id,
+                      'security-group')
+              for resource in instances:
+                  merge_discovered(
+                      deployments, resource, 'TargetInstanceId',
+                      resource['InstanceId'], stack_id, source_server_id,
+                      'target-instance')
+              for resource in targets:
+                  merge_discovered(
+                      deployments, resource, 'MirrorTargetId',
+                      resource['TrafficMirrorTargetId'], stack_id,
+                      source_server_id, 'traffic-mirror-target')
+              for resource in mirror_filters:
+                  merge_discovered(
+                      deployments, resource, 'MirrorFilterId',
+                      resource['TrafficMirrorFilterId'], stack_id,
+                      source_server_id, 'traffic-mirror-filter')
+              for resource in sessions:
+                  merge_discovered(
+                      deployments, resource, 'MirrorSessionId',
+                      resource['TrafficMirrorSessionId'], stack_id,
+                      source_server_id, 'traffic-mirror-session')
+              return inventory
+
+          def remaining_seconds(context):
+              return context.get_remaining_time_in_millis() / 1000.0
+
+          def wait_for_verified_termination(instance_id, context):
+              for _ in range(30):
+                  if remaining_seconds(context) <= 45:
+                      raise TimeoutError('TimeBudgetReserved:InstanceTermination')
+                  try:
+                      response = ec2.describe_instances(InstanceIds=[instance_id])
+                  except Exception as error:
+                      if error_code(error) == 'InvalidInstanceID.NotFound':
+                          return
+                      raise
+                  states = [
+                      item.get('State', {}).get('Name')
+                      for reservation in response.get('Reservations', [])
+                      for item in reservation.get('Instances', [])
+                  ]
+                  if not states or all(state == 'terminated' for state in states):
+                      return
+                  time.sleep(10)
+              raise TimeoutError('InstanceTerminationNotVerified')
+
+          def delete_security_group_with_retry(group_id, context):
+              for _ in range(12):
+                  if remaining_seconds(context) <= 45:
+                      raise TimeoutError('TimeBudgetReserved:SecurityGroupDeletion')
+                  try:
+                      ec2.delete_security_group(GroupId=group_id)
+                      return
+                  except Exception as error:
+                      code = error_code(error)
+                      if code == 'InvalidGroup.NotFound':
+                          return
+                      if code != 'DependencyViolation':
+                          raise
+                  time.sleep(5)
+              raise TimeoutError('SecurityGroupDeletionNotVerified')
+
+          def handler(event, context):
+              logger.info("Cleanup requestType=%s requestId=%s",
+                          event.get('RequestType'), context.aws_request_id)
+              props = event.get('ResourceProperties', {})
+              deterministic_id = f"Cleanup-{props.get('SourceServerId', 'unknown')}"
+              physical_id = event.get('PhysicalResourceId') or deterministic_id
+
+              if event['RequestType'] != 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {'Message': 'No cleanup needed for Create/Update'},
+                                   physicalResourceId=physical_id)
+                  return
+
+              source_server_id = props['SourceServerId']
+              stack_id = props['StackId']
+              parameter_name = props['InventoryParameterName']
+              lifecycle_parameter_name = props['LifecycleParameterName']
+              ownership_parameter_name = props['OwnershipParameterName']
+              errors = []
+              deleted = []
+
+              try:
+                  # This separate guard is monotonic for the lifetime of a delete.
+                  # Setup has read-only access and cannot restore it to ACTIVE.
+                  ssm.put_parameter(
+                      Name=lifecycle_parameter_name, Type='String',
+                      Value='DELETING', Overwrite=True)
+                  inventory = load_inventory(parameter_name, stack_id,
+                                             source_server_id)
+                  inventory['LifecycleState'] = 'DELETING'
+                  save_inventory(parameter_name, inventory)
+
+                  # An invocation accepted before the EventBridge rule was removed
+                  # must finish or observe DELETING and roll back before cleanup.
+                  # Fail this delete attempt closed; CloudFormation retry resumes
+                  # from the same exact inventory after the invocation clears.
+                  active_invocation = inventory.get('ActiveInvocationId')
+                  active_expires_at = inventory.get('ActiveInvocationExpiresAt', 0)
+                  if active_invocation and active_expires_at > int(time.time()):
+                      logger.warning("Cleanup deferred because setup invocation is active")
+                      cfnresponse.send(
+                          event, context, cfnresponse.FAILED,
+                          {'Message': 'Cleanup deferred; retry required',
+                           'Deleted': [],
+                           'Errors': ['SetupInvocationInProgress']},
+                          physicalResourceId=physical_id)
+                      return
+                  if active_invocation:
+                      logger.warning("Expired setup invocation marker cleared")
+                      inventory.pop('ActiveInvocationId', None)
+                      inventory.pop('ActiveInvocationExpiresAt', None)
+                      save_inventory(parameter_name, inventory)
+
+                  # Reconstruct any ID lost in a create-before-persist crash
+                  # window before destructive cleanup. Discovery itself is
+                  # fail-closed: duplicates, missing identity tags, or API errors
+                  # fail the CloudFormation delete and retain the ownership lock.
+                  inventory = discover_owned_resources(
+                      inventory, stack_id, source_server_id)
+                  save_inventory(parameter_name, inventory)
+                  deployments = inventory.setdefault('Deployments', {})
+
+                  for replication_server_id, record in list(deployments.items()):
+                      # Delete session, target, and filter by exact persisted ID.
+                      for key, label, describe, delete in [
+                          ('MirrorSessionId', 'Session', describe_session,
+                           lambda rid: ec2.delete_traffic_mirror_session(
+                               TrafficMirrorSessionId=rid)),
+                          ('MirrorTargetId', 'Target', describe_target,
+                           lambda rid: ec2.delete_traffic_mirror_target(
+                               TrafficMirrorTargetId=rid)),
+                          ('MirrorFilterId', 'Filter', describe_filter,
+                           lambda rid: ec2.delete_traffic_mirror_filter(
+                               TrafficMirrorFilterId=rid))
+                      ]:
+                          resource_id = record.get(key)
+                          if not resource_id:
+                              continue
+                          try:
+                              resources = describe(resource_id)
+                              if resources:
+                                  verify_owned(resources[0], stack_id,
+                                               source_server_id,
+                                               replication_server_id, label)
+                                  delete(resource_id)
+                                  deleted.append(f'{label}: {resource_id}')
+                              record.pop(key, None)
+                              save_inventory(parameter_name, inventory)
+                          except Exception as error:
+                              errors.append(f'{label} {resource_id}: {safe_error(error)}')
+
+                      instance_id = record.get('TargetInstanceId')
+                      if instance_id:
+                          try:
+                              instances = describe_instance(instance_id)
+                              if instances and instances[0].get('State', {}).get('Name') != 'terminated':
+                                  verify_owned(instances[0], stack_id,
+                                               source_server_id,
+                                               replication_server_id,
+                                               'target-instance')
+                                  ec2.terminate_instances(InstanceIds=[instance_id])
+                                  wait_for_verified_termination(instance_id, context)
+                                  deleted.append(f'Instance: {instance_id}')
+                              record.pop('TargetInstanceId', None)
+                              record.pop('TargetNetworkInterfaceId', None)
+                              record.pop('TargetLaunchToken', None)
+                              save_inventory(parameter_name, inventory)
+                          except Exception as error:
+                              errors.append(f'Instance {instance_id}: {safe_error(error)}')
+
+                      group_id = record.get('SecurityGroupId')
+                      if group_id:
+                          try:
+                              groups = describe_group(group_id)
+                              if groups:
+                                  verify_owned(groups[0], stack_id,
+                                               source_server_id,
+                                               replication_server_id,
+                                               'security-group')
+                                  delete_security_group_with_retry(group_id, context)
+                                  deleted.append(f'SecurityGroup: {group_id}')
+                              record.pop('SecurityGroupId', None)
+                              save_inventory(parameter_name, inventory)
+                          except Exception as error:
+                              errors.append(f'SecurityGroup {group_id}: {safe_error(error)}')
+
+                      if not any(key.endswith('Id') for key in record):
+                          deployments.pop(replication_server_id, None)
+                          save_inventory(parameter_name, inventory)
+
+                  if deployments and not errors:
+                      errors.append('OwnedResourcesRemainAfterCleanup')
+
+                  # Retain the cross-stack lock until every owned resource has
+                  # been removed. A failed delete remains safely non-reclaimable.
+                  if not errors:
+                      try:
+                          release_source_lock(
+                              ownership_parameter_name, stack_id)
+                      except Exception as error:
+                          errors.append(
+                              f'OwnershipLock: {safe_error(error)}')
+
+                  result = {
+                      'Message': ('Cleanup completed' if not errors else
+                                  'Cleanup incomplete; retry required'),
+                      'Deleted': deleted,
+                      'Errors': errors
+                  }
+                  logger.info("Cleanup completed deletedCount=%d errorCount=%d",
+                              len(deleted), len(errors))
+                  cfnresponse.send(
+                      event, context,
+                      cfnresponse.FAILED if errors else cfnresponse.SUCCESS,
+                      result, physicalResourceId=physical_id)
+
+              except Exception as error:
+                  details = safe_error(error)
+                  logger.error("Cleanup failed requestId=%s details=%s",
+                               context.aws_request_id, details)
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED,
+                      {'Message': 'Cleanup failed', 'Deleted': deleted,
+                       'Errors': [details]},
+                      physicalResourceId=physical_id)
+
+  CleanupResource:
+    Type: Custom::Cleanup
+    DependsOn:
+      - MirroringLambdaFunction
+    Properties:
+      ServiceToken: !GetAtt CleanupFunction.Arn
+      # Covers the 300-second function plus Lambda's two asynchronous retries,
+      # while bounding a missing-response wait below the one-hour default.
+      ServiceTimeout: 1200
+      ReplicationService: !Ref ReplicationService
+      SourceServerId: !Ref SourceServerId
+      StackId: !Ref AWS::StackId
+      InventoryParameterName: !Ref MirroringInventoryParameter
+      LifecycleParameterName: !Ref MirroringLifecycleParameter
+      OwnershipParameterName: !If
+        - MgnReplicationService
+        - !Sub "/vpc-traffic-mirroring/ownership/mgn/${SourceServerId}"
+        - !Sub "/vpc-traffic-mirroring/ownership/drs/${SourceServerId}"
+
+  #============================================================================
+  # STEP 6: EventBridge Rule - Trigger on EC2 Running State
+  #============================================================================
+  
+  MirroringEventRule:
+    Type: AWS::Events::Rule
+    DependsOn:
+      - CleanupResource
+      - MirroringEventBridgeDLQPolicy
+    Properties:
+      Name: !Sub "${AWS::StackName}-RSMirroringRule"
+      Description: !Sub "Detect replication server for source ${SourceServerId}"
+      EventPattern:
+        detail-type:
+          - "EC2 Instance State-change Notification"
+        source:
+          - "aws.ec2"
+        detail:
+          state:
+            - "running"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt MirroringLambdaFunction.Arn
+          Id: "MirroringLambdaTarget"
+          DeadLetterConfig:
+            Arn: !GetAtt MirroringEventBridgeDLQ.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
+            MaximumRetryAttempts: 2
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MirroringLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt MirroringEventRule.Arn
+
+  MirroringFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Mirroring Lambda reported an execution error"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MirroringLambdaFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - AlarmNotificationsEnabled
+        - - !Ref AlarmNotificationTopicArn
+        - []
+      OKActions: []
+      InsufficientDataActions: []
+
+  MirroringFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Mirroring Lambda experienced more than five throttles in five minutes"
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MirroringLambdaFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - AlarmNotificationsEnabled
+        - - !Ref AlarmNotificationTopicArn
+        - []
+      OKActions: []
+      InsufficientDataActions: []
+
+  MirroringDLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "The mirroring Lambda dead-letter queue contains failed events"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt MirroringDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - AlarmNotificationsEnabled
+        - - !Ref AlarmNotificationTopicArn
+        - []
+      OKActions: []
+      InsufficientDataActions: []
+
+  MirroringEventBridgeDLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "The EventBridge target DLQ contains undelivered events"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt MirroringEventBridgeDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - AlarmNotificationsEnabled
+        - - !Ref AlarmNotificationTopicArn
+        - []
+      OKActions: []
+      InsufficientDataActions: []
+
+  MirroringEventBridgeDLQDeliveryFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "EventBridge failed to write an undelivered event to its target DLQ"
+      Namespace: AWS/Events
+      MetricName: InvocationsFailedToBeSentToDLQ
+      Dimensions:
+        - Name: RuleName
+          Value: !Ref MirroringEventRule
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - AlarmNotificationsEnabled
+        - - !Ref AlarmNotificationTopicArn
+        - []
+      OKActions: []
+      InsufficientDataActions: []
+
+  MirroringEventBridgeFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "EventBridge failed to invoke the mirroring Lambda"
+      Namespace: AWS/Events
+      MetricName: FailedInvocations
+      Dimensions:
+        - Name: RuleName
+          Value: !Ref MirroringEventRule
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - AlarmNotificationsEnabled
+        - - !Ref AlarmNotificationTopicArn
+        - []
+      OKActions: []
+      InsufficientDataActions: []
+
+#==============================================================================
+# OUTPUTS
+#==============================================================================
+
+Outputs:
+  SourceServerId:
+    Description: "Source server configured for traffic mirroring"
+    Value: !Ref SourceServerId
+
+  ReplicationService:
+    Description: "Replication service in use"
+    Value: !Ref ReplicationService
+
+  MirroringTagAdded:
+    Description: "Tags added to source server's replication settings"
+    Value: !Sub "Mirroring-${SourceServerId}=yes; MirroringStackId=${AWS::StackId}"
+
+  StackOwnershipId:
+    Description: "Unique ownership ID used to isolate this stack's mirroring resources"
+    Value: !Ref AWS::StackId
+
+  LambdaLogGroup:
+    Description: "CloudWatch Logs for monitoring"
+    Value: !Sub "/aws/lambda/${AWS::StackName}-MirroringFunction"
+
+  MirroringInventoryParameterName:
+    Description: "Stack-owned durable inventory of exact mirroring resource IDs"
+    Value: !Ref MirroringInventoryParameter
+
+  MirroringDeadLetterQueueNames:
+    Description: "Lambda processing DLQ and EventBridge target delivery DLQ"
+    Value: !Join
+      - ", "
+      - - !GetAtt MirroringDLQ.QueueName
+        - !GetAtt MirroringEventBridgeDLQ.QueueName
+
+  MirroringAlarmNames:
+    Description: "CloudWatch alarms for Lambda errors/throttles, both DLQs, and EventBridge failures"
+    Value: !Join
+      - ", "
+      - - !Ref MirroringFunctionErrorsAlarm
+        - !Ref MirroringFunctionThrottlesAlarm
+        - !Ref MirroringDLQMessagesAlarm
+        - !Ref MirroringEventBridgeDLQMessagesAlarm
+        - !Ref MirroringEventBridgeDLQDeliveryFailuresAlarm
+        - !Ref MirroringEventBridgeFailuresAlarm
+
+  AlarmNotificationConfiguration:
+    Description: "SNS alarm notification configuration"
+    Value: !If
+      - AlarmNotificationsEnabled
+      - !Sub "Enabled: ${AlarmNotificationTopicArn}"
+      - "Disabled: inspect alarms in the CloudWatch console"
+
+  CleanupInstructions:
+    Description: "How to clean up"
+    Value: !Sub |
+      This stack refuses deployment when another StackId already owns the source server
+      replication setting. On deletion, it removes the source marker and ownership tag only
+      if the setting still carries this stack's exact StackId; externally changed ownership
+      is left unchanged. Cleanup removes this stack's traffic mirror session, target, filter,
+      mirror target instance, security groups, both DLQs, Lambda functions, IAM roles,
+      EventBridge rule, alarms, inventory, and log groups. The service-managed replication
+      server is never terminated by this stack; AWS Transform MGN / AWS DRS reclaims it
+      through the service lifecycle after the unique replication settings are removed.
