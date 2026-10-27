@@ -45,6 +45,7 @@ On stack deletion, CloudFormation removes the EventBridge rule before cleanup. C
 - An AWS account with permissions to create CloudFormation stacks, Lambda functions, IAM roles, EC2 instances, and VPC Traffic Mirroring resources.
 - An active source server in AWS Transform MGN or AWS DRS that has completed [replication initiation](https://docs.aws.amazon.com/mgn/latest/ug/replication-progress.html) (agent connected to replication server).
 - The source server ID (starts with `s-`). Find it in the AWS Transform MGN or AWS DRS console under **Source servers**.
+- For AWS DRS, the stack works with either setting of **Associate default Elastic Disaster Recovery security group** in the source server's replication settings. When it is enabled, AWS DRS validates its default security group permissions during the tagging step; the template includes the required grants.
 
 ## Deployment
 
@@ -67,6 +68,8 @@ On stack deletion, CloudFormation removes the EventBridge rule before cleanup. C
 
 
 `ReplicationService` and `SourceServerId` are immutable after stack creation. To troubleshoot another source or switch between MGN and DRS, delete this stack and create a new stack after cleanup completes. The stack refuses deployment when the selected source already carries a different `MirroringStackId`; it does not take ownership from another live stack. During a failed identity update, CloudFormation rolls the custom resource back before restoring its parameter-derived IAM policy. The tagging role therefore has read-only `GetReplicationConfiguration` access across MGN/DRS source-server resources so it can verify the original owned identity during rollback; `UpdateReplicationConfiguration` remains restricted to the single source selected by the current stack operation.
+
+When `ReplicationService` is AWS DRS, the tagging role also carries the EC2 permissions that AWS DRS evaluates for its **default Replication Server security group** during `UpdateReplicationConfiguration`. AWS DRS performs this check as an EC2 dry run whenever the source server's replication settings have **Associate default Elastic Disaster Recovery security group** enabled, even when that group already exists in the staging VPC, and rejects the update with `AccessDenied` if the caller cannot pass it. The grants follow the AWS managed policy `AWSElasticDisasterRecoveryConsoleFullAccess_v2`: `ec2:CreateSecurityGroup` on VPCs in the stack's Region and account, plus `ec2:CreateSecurityGroup`, `ec2:CreateTags`, and security group rule actions limited to groups tagged `AWSElasticDisasterRecoveryManaged` and usable only when AWS DRS calls EC2 on the role's behalf (`aws:ViaAWSService`). The Lambda code never calls these actions directly, and stacks created for AWS Transform MGN do not receive them.
 
 6. If you set `EnableAlarmNotifications=true`, paste an existing SNS topic ARN from the same account and Region into `AlarmNotificationTopicArn`. Ensure the topic already has the required subscriptions, encryption, and resource policy. The ARN pattern validates syntax but cannot dynamically enforce the current account; treat cross-account or cross-Region delivery as a separate reviewed design. Otherwise retain the defaults `false` and `NONE`.
 7. Choose **Next**, then **Next** again.

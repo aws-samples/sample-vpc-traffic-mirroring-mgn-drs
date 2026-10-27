@@ -618,6 +618,63 @@ Resources:
                   - ec2:DescribeSubnets
                   - ec2:DescribeSecurityGroups
                 Resource: '*'
+              # DRS additionally authorizes its default replication-server
+              # security group when associateDefaultSecurityGroup is true, even
+              # when that group already exists in the staging VPC. Without these
+              # grants DRS rejects UpdateReplicationConfiguration with
+              # "do not have permission for ec2:CreateSecurityGroup". MGN does not
+              # perform this check, so the grants are omitted for MGN stacks.
+              # Shape follows AWSElasticDisasterRecoveryConsoleFullAccess_v2: the
+              # security-group grants apply only when DRS calls EC2 on this role's
+              # behalf and only to groups DRS tags AWSElasticDisasterRecoveryManaged.
+              # The VPC statement alone cannot create a group; EC2 also requires
+              # the conditioned security-group statement for the same request.
+              - !If
+                - MgnReplicationService
+                - !Ref AWS::NoValue
+                - Sid: DrsDefaultSecurityGroupVpcAuthorization
+                  Effect: Allow
+                  Action: ec2:CreateSecurityGroup
+                  Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/*"
+              - !If
+                - MgnReplicationService
+                - !Ref AWS::NoValue
+                - Sid: DrsDefaultSecurityGroupCreateViaService
+                  Effect: Allow
+                  Action: ec2:CreateSecurityGroup
+                  Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                  Condition:
+                    Bool:
+                      aws:ViaAWSService: "true"
+                    "Null":
+                      aws:RequestTag/AWSElasticDisasterRecoveryManaged: "false"
+              - !If
+                - MgnReplicationService
+                - !Ref AWS::NoValue
+                - Sid: DrsDefaultSecurityGroupTagOnCreateViaService
+                  Effect: Allow
+                  Action: ec2:CreateTags
+                  Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                  Condition:
+                    Bool:
+                      aws:ViaAWSService: "true"
+                    StringEquals:
+                      ec2:CreateAction: CreateSecurityGroup
+              - !If
+                - MgnReplicationService
+                - !Ref AWS::NoValue
+                - Sid: DrsDefaultSecurityGroupRulesViaService
+                  Effect: Allow
+                  Action:
+                    - ec2:AuthorizeSecurityGroupIngress
+                    - ec2:AuthorizeSecurityGroupEgress
+                    - ec2:RevokeSecurityGroupEgress
+                  Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                  Condition:
+                    Bool:
+                      aws:ViaAWSService: "true"
+                    "Null":
+                      aws:ResourceTag/AWSElasticDisasterRecoveryManaged: "false"
               # Rollback can invoke the old custom-resource identity before
               # CloudFormation restores this parameter-derived role policy.
               # Read-only lock access therefore spans this dedicated namespace;
