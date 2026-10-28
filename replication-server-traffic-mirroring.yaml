@@ -1106,9 +1106,14 @@ Resources:
 
               # Filter rules are not taggable. Authorize the generated rule ARN
               # only when the parent filter is tagged as owned by this stack.
+              # The same ownership condition gates enabling the amazon-dns
+              # network service, which mirrors replication-server DNS traffic to
+              # the Amazon-provided resolver that ordinary CIDR rules never match.
               - Sid: AddRuleToStackFilter
                 Effect: Allow
-                Action: ec2:CreateTrafficMirrorFilterRule
+                Action:
+                  - ec2:CreateTrafficMirrorFilterRule
+                  - ec2:ModifyTrafficMirrorFilterNetworkServices
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:traffic-mirror-filter/*"
                 Condition:
                   StringEquals:
@@ -1758,6 +1763,21 @@ Resources:
               normalize = lambda item: json.dumps(item, sort_keys=True, separators=(',', ':'))
               if sorted(map(normalize, actual)) != sorted(map(normalize, desired)):
                   raise ValueError('ConfigurationMismatch:mirror-filter-rules')
+              # CIDR rules never match traffic to the Amazon-provided DNS
+              # resolver. Enable the amazon-dns network service so the capture
+              # also shows the replication server's endpoint name resolution.
+              # CreateTrafficMirrorFilter cannot set this, so it is reconciled
+              # here, before the session exists, and re-checked after the call.
+              if 'amazon-dns' not in refreshed.get('NetworkServices', []):
+                  ec2.modify_traffic_mirror_filter_network_services(
+                      TrafficMirrorFilterId=mirror_filter['TrafficMirrorFilterId'],
+                      AddNetworkServices=['amazon-dns']
+                  )
+                  refreshed = ec2.describe_traffic_mirror_filters(
+                      TrafficMirrorFilterIds=[mirror_filter['TrafficMirrorFilterId']]
+                  )['TrafficMirrorFilters'][0]
+              if sorted(refreshed.get('NetworkServices', [])) != ['amazon-dns']:
+                  raise ValueError('ConfigurationMismatch:mirror-filter-network-services')
               return refreshed
 
           def next_available_session_number(source_eni):
